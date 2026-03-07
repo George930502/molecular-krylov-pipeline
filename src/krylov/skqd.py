@@ -105,8 +105,10 @@ class SampleBasedKrylovDiagonalization:
     """
 
     # Guard: systems larger than this skip full subspace enumeration
-    # to prevent OOM. Matches FlowGuidedSKQD.MAX_FULL_SUBSPACE_SIZE.
-    MAX_FULL_SUBSPACE_SIZE = 100000
+    # to prevent OOM. Dense complex128 matrix is n² × 16 bytes:
+    #   15000² = 3.6 GB, 20000² = 6.4 GB, 63504² = 64.5 GB
+    # Keep aligned with FlowGuidedSKQD.MAX_FULL_SUBSPACE_SIZE.
+    MAX_FULL_SUBSPACE_SIZE = 15000
 
     def __init__(
         self,
@@ -1063,13 +1065,15 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
     the energy estimate through systematic subspace expansion.
 
     OPTIMIZATION FOR LARGE SYSTEMS:
-    For systems with >100k valid configurations, we use NF-basis-guided
+    For systems with >15k valid configurations, we use NF-basis-guided
     Krylov expansion instead of full particle-conserving subspace evolution.
-    This avoids building the prohibitively large Hamiltonian matrix.
+    This avoids building the prohibitively large dense Hamiltonian matrix
+    (n² × 16 bytes for complex128: 15000² = 3.6 GB, 63504² = 64.5 GB).
     """
 
     # Threshold for using NF-guided Krylov (vs full subspace evolution)
-    MAX_FULL_SUBSPACE_SIZE = 100000
+    # Must match SampleBasedKrylovDiagonalization.MAX_FULL_SUBSPACE_SIZE.
+    MAX_FULL_SUBSPACE_SIZE = 15000
 
     def __init__(
         self,

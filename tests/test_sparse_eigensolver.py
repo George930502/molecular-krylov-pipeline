@@ -34,8 +34,8 @@ class TestMaxFullSubspaceGuard:
             "Standard SKQD missing MAX_FULL_SUBSPACE_SIZE guard (B13)"
 
     def test_guard_value(self):
-        """Guard should be 100000 (matching FlowGuidedSKQD)."""
-        assert SampleBasedKrylovDiagonalization.MAX_FULL_SUBSPACE_SIZE == 100000
+        """Guard should be 15000 (matching FlowGuidedSKQD). Dense complex128: 15000²×16=3.6GB."""
+        assert SampleBasedKrylovDiagonalization.MAX_FULL_SUBSPACE_SIZE == 15000
 
     @pytest.mark.molecular
     def test_guard_prevents_oom(self, lih_hamiltonian):
