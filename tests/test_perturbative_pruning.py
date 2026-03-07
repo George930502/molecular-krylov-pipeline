@@ -445,3 +445,50 @@ class TestBasisPruning:
             f"MP2 pruning energy {e_mp2:.8f} Ha should be <= "
             f"random average {avg_random_e:.8f} Ha"
         )
+
+
+class TestMP2CASGuard:
+    """Test that MP2 pruning correctly rejects non-canonical (CASSCF) orbitals."""
+
+    def test_non_diagonal_fock_raises(self):
+        """MP2 should raise ValueError when Fock matrix is non-diagonal (CAS-like)."""
+        from utils.perturbative_pruning import compute_mp2_amplitudes
+
+        # Create a mock hamiltonian with non-diagonal Fock matrix
+        # by making h1e have large off-diagonal elements
+        n_orb, n_occ = 4, 2
+
+        class MockIntegrals:
+            pass
+
+        class MockHamiltonian:
+            pass
+
+        integrals = MockIntegrals()
+        # h1e with large off-diagonals (simulating CASSCF active-space h1e)
+        integrals.h1e = np.array([
+            [-1.0, 0.3, 0.0, 0.0],
+            [0.3, -0.5, 0.2, 0.0],
+            [0.0, 0.2, 0.5, 0.1],
+            [0.0, 0.0, 0.1, 1.0],
+        ])
+        # h2e with small values so h1e dominates Fock off-diagonals
+        integrals.h2e = np.zeros((n_orb, n_orb, n_orb, n_orb))
+        integrals.n_alpha = n_occ
+        integrals.n_beta = n_occ
+        integrals.n_orbitals = n_orb
+
+        ham = MockHamiltonian()
+        ham.integrals = integrals
+
+        with pytest.raises(ValueError, match="canonical.*HF.*orbitals"):
+            compute_mp2_amplitudes(ham)
+
+    @pytest.mark.molecular
+    def test_canonical_hf_passes(self, lih_hamiltonian):
+        """MP2 should work fine with canonical HF orbitals (non-CAS)."""
+        from utils.perturbative_pruning import compute_mp2_amplitudes
+
+        # Should NOT raise — LiH uses canonical HF MOs
+        t2, e_corr = compute_mp2_amplitudes(lih_hamiltonian)
+        assert e_corr < 0.0

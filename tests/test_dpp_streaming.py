@@ -154,5 +154,214 @@ class TestEndToEndDiversitySelection:
         assert error_mha < 1.0, f"N2 error {error_mha:.4f} mHa"
 
 
+class TestFindIndicesHashBased:
+    """Tests for M1 fix: _find_indices should use hash-based O(n) lookup
+    instead of O(n*m) pairwise comparison."""
+
+    def _naive_find_indices(self, all_configs, subset_configs):
+        """Reference O(n*m) implementation for correctness checking."""
+        indices = []
+        for i in range(len(subset_configs)):
+            matches = (all_configs == subset_configs[i]).all(dim=1)
+            idx = torch.where(matches)[0]
+            if len(idx) > 0:
+                indices.append(idx[0].item())
+        return torch.tensor(indices, device=all_configs.device)
+
+    def test_find_indices_matches_naive(self):
+        """Optimized _find_indices must return same results as naive O(n*m) version."""
+        torch.manual_seed(123)
+        n, sites = 200, 20
+        all_configs = torch.randint(0, 2, (n, sites))
+        # Select a random subset
+        subset_idx = torch.randperm(n)[:50]
+        subset_configs = all_configs[subset_idx]
+
+        cfg = DiversityConfig(max_configs=50)
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, subset_configs)
+        expected = self._naive_find_indices(all_configs, subset_configs)
+
+        assert torch.equal(result, expected), (
+            f"Mismatch: result={result.tolist()}, expected={expected.tolist()}"
+        )
+
+    def test_find_indices_empty_subset(self):
+        """Empty subset should return empty tensor."""
+        n, sites = 50, 10
+        all_configs = torch.randint(0, 2, (n, sites))
+        subset_configs = torch.empty(0, sites, dtype=all_configs.dtype)
+
+        cfg = DiversityConfig()
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, subset_configs)
+        assert len(result) == 0
+
+    def test_find_indices_single_config(self):
+        """Single config subset should find the correct index."""
+        n, sites = 100, 12
+        torch.manual_seed(42)
+        all_configs = torch.randint(0, 2, (n, sites))
+        target_idx = 37
+        subset_configs = all_configs[target_idx:target_idx + 1]
+
+        cfg = DiversityConfig()
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, subset_configs)
+        assert len(result) == 1
+        assert result[0].item() == target_idx
+
+    def test_find_indices_preserves_order(self):
+        """Returned indices must match the order of subset_configs."""
+        torch.manual_seed(99)
+        n, sites = 100, 14
+        all_configs = torch.randint(0, 2, (n, sites))
+        # Pick indices in a specific non-sorted order
+        subset_idx = torch.tensor([50, 10, 90, 30, 70])
+        subset_configs = all_configs[subset_idx]
+
+        cfg = DiversityConfig()
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, subset_configs)
+        assert result.tolist() == subset_idx.tolist()
+
+    def test_find_indices_missing_config_skipped(self):
+        """Configs not found in all_configs should be skipped (not crash)."""
+        n, sites = 50, 10
+        torch.manual_seed(7)
+        all_configs = torch.randint(0, 2, (n, sites))
+        # Create a config guaranteed not in all_configs
+        missing = torch.ones(1, sites, dtype=all_configs.dtype) * 2  # value=2, not binary
+        subset_configs = torch.cat([all_configs[:3], missing], dim=0)
+
+        cfg = DiversityConfig()
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, subset_configs)
+        # Should find the first 3 but skip the missing one
+        assert len(result) == 3
+
+    def test_find_indices_duplicate_configs_returns_first(self):
+        """When all_configs has duplicates, return the first occurrence index."""
+        sites = 8
+        base = torch.tensor([[1, 0, 1, 0, 1, 0, 1, 0]])
+        # Duplicate at index 0 and 5
+        all_configs = torch.randint(0, 2, (10, sites))
+        all_configs[0] = base
+        all_configs[5] = base
+
+        cfg = DiversityConfig()
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, base)
+        assert len(result) == 1
+        # Should return index 0 (first occurrence)
+        assert result[0].item() == 0
+
+    def test_find_indices_40_sites(self):
+        """Must work correctly for 40-site configs (realistic 40Q system)."""
+        torch.manual_seed(55)
+        n, sites = 500, 40
+        all_configs = torch.randint(0, 2, (n, sites))
+        subset_idx = torch.randperm(n)[:100]
+        subset_configs = all_configs[subset_idx]
+
+        cfg = DiversityConfig()
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, subset_configs)
+        expected = self._naive_find_indices(all_configs, subset_configs)
+        assert torch.equal(result, expected)
+
+    def test_find_indices_64_sites(self):
+        """Must work for 64-site configs (max bitpack width)."""
+        torch.manual_seed(77)
+        n, sites = 200, 64
+        all_configs = torch.randint(0, 2, (n, sites))
+        subset_idx = torch.randperm(n)[:30]
+        subset_configs = all_configs[subset_idx]
+
+        cfg = DiversityConfig()
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, subset_configs)
+        expected = self._naive_find_indices(all_configs, subset_configs)
+        assert torch.equal(result, expected)
+
+    def test_find_indices_over_64_sites_fallback(self):
+        """Systems with >64 sites must use tuple-hash fallback, not crash."""
+        torch.manual_seed(88)
+        n, sites = 50, 80  # >64 sites
+        all_configs = torch.randint(0, 2, (n, sites))
+        subset_idx = torch.randperm(n)[:10]
+        subset_configs = all_configs[subset_idx]
+
+        cfg = DiversityConfig()
+        ref = all_configs[0]
+        selector = DiversitySelector(cfg, ref, sites // 2)
+
+        result = selector._find_indices(all_configs, subset_configs)
+        expected = self._naive_find_indices(all_configs, subset_configs)
+        assert torch.equal(result, expected)
+
+    def test_find_indices_scaling_linear(self):
+        """Benchmark: O(n) hash lookup should scale linearly, not quadratically.
+
+        We compare wall-clock time at n=5000 vs n=20000 (4x growth).
+        If truly O(n+m), the ratio should be ~4x.
+        If O(n*m) with m proportional to n, ratio would be ~16x.
+        We use sizes large enough to avoid timer-resolution noise, and
+        enough iterations to average out xdist CPU contention.
+        """
+        import time
+
+        sites = 20
+
+        def time_find_indices(n, m):
+            torch.manual_seed(42)
+            all_configs = torch.randint(0, 2, (n, sites))
+            subset_idx = torch.randperm(n)[:m]
+            subset_configs = all_configs[subset_idx]
+
+            cfg = DiversityConfig()
+            ref = all_configs[0]
+            selector = DiversitySelector(cfg, ref, sites // 2)
+
+            # Warmup (2 rounds to stabilize JIT/alloc)
+            selector._find_indices(all_configs, subset_configs)
+            selector._find_indices(all_configs, subset_configs)
+
+            n_iter = 5
+            start = time.perf_counter()
+            for _ in range(n_iter):
+                selector._find_indices(all_configs, subset_configs)
+            elapsed = time.perf_counter() - start
+            return elapsed / n_iter
+
+        t_small = time_find_indices(5000, 1000)
+        t_large = time_find_indices(20000, 4000)
+
+        ratio = t_large / max(t_small, 1e-9)
+        # O(n+m) hash lookup: ratio should be ~4-6x (4x data growth + overhead)
+        # O(n*m) naive: ratio would be ~16x
+        # Generous bound of 12x covers CPU contention under xdist
+        assert ratio < 12, (
+            f"Scaling ratio {ratio:.1f}x suggests non-linear behavior "
+            f"(small={t_small*1000:.1f}ms, large={t_large*1000:.1f}ms)"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

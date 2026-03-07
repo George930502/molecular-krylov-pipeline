@@ -664,8 +664,47 @@ class MolecularHamiltonian(Hamiltonian):
             self._double_ab_r = torch.empty(0, dtype=torch.long, device=device)
             self._double_ab_h2e = torch.empty(0, device=device)
 
-        # Precompute powers of 2 for integer encoding (on GPU)
-        self._powers_gpu = (2 ** torch.arange(self.num_sites, device=device, dtype=torch.long)).flip(0)
+        # Precompute powers of 2 for integer encoding (on GPU).
+        # For num_sites >= 64, int64 overflows at 2^63, so we split into
+        # two halves. See utils.config_hash for details.
+        if self.num_sites < 64:
+            self._powers_gpu = (
+                2 ** torch.arange(self.num_sites, device=device, dtype=torch.long)
+            ).flip(0)
+            self._powers_gpu_hi = None
+            self._powers_gpu_lo = None
+        else:
+            self._powers_gpu = None  # Cannot use single int64 encoding
+            half = self.num_sites // 2
+            n_lo = self.num_sites - half
+            self._powers_gpu_hi = (
+                2 ** torch.arange(half, device=device, dtype=torch.long)
+            ).flip(0)
+            self._powers_gpu_lo = (
+                2 ** torch.arange(n_lo, device=device, dtype=torch.long)
+            ).flip(0)
+
+    def _config_int_hash(self, configs: torch.Tensor) -> list:
+        """Hash binary configs to integers for fast dict/set lookups.
+
+        Overflow-safe: for num_sites >= 64, returns list of (int, int) tuples
+        instead of plain ints. Both types are hashable and usable as dict keys.
+
+        Args:
+            configs: (n_configs, num_sites) binary tensor on self.device
+
+        Returns:
+            list of int (n_sites < 64) or list of tuple[int, int] (n_sites >= 64)
+        """
+        if self._powers_gpu is not None:
+            # Standard path: single int64 encoding
+            return (configs.long() * self._powers_gpu).sum(dim=1).cpu().tolist()
+        else:
+            # Split path: two halves to avoid int64 overflow
+            half = self.num_sites // 2
+            hash_hi = (configs[:, :half].long() * self._powers_gpu_hi).sum(dim=1)
+            hash_lo = (configs[:, half:].long() * self._powers_gpu_lo).sum(dim=1)
+            return list(zip(hash_hi.cpu().tolist(), hash_lo.cpu().tolist()))
 
     def _precompute_sparse_h2e(self):
         """
@@ -1507,19 +1546,16 @@ class MolecularHamiltonian(Hamiltonian):
         # Vectorized diagonal (already GPU-accelerated)
         H.diagonal().copy_(self.diagonal_elements_batch(configs))
 
-        # Use GPU-based integer encoding for hash lookups
-        # Encode config as integer: sum(config[i] * 2^i) - stays on GPU
-        config_ints = (configs.long() * self._powers_gpu).sum(dim=1)
-        config_ints_cpu = config_ints.cpu().tolist()  # Single transfer
+        # Use overflow-safe integer encoding for hash lookups
+        config_ints_cpu = self._config_int_hash(configs)
         config_hash = {config_ints_cpu[i]: i for i in range(n_configs)}
 
         # Get ALL connections at once using vectorized batch method
         all_connected, all_elements, batch_indices = self.get_connections_vectorized_batch(configs)
 
         if len(all_connected) > 0:
-            # Encode connected configs on GPU
-            connected_ints = (all_connected.long() * self._powers_gpu).sum(dim=1)
-            connected_ints_cpu = connected_ints.cpu().tolist()  # Single transfer
+            # Encode connected configs (overflow-safe)
+            connected_ints_cpu = self._config_int_hash(all_connected)
             batch_indices_cpu = batch_indices.cpu().tolist()  # Single transfer
 
             # B3: Vectorized scatter — build index arrays then assign at once
@@ -1643,14 +1679,12 @@ class MolecularHamiltonian(Hamiltonian):
                 torch.tensor([], dtype=torch.float64, device=device),
             )
 
-        # Integer encoding for fast lookup
-        config_ints = (configs.long() * self._powers_gpu).sum(dim=1)
-        config_ints_cpu = config_ints.cpu().tolist()
+        # Overflow-safe integer encoding for fast lookup
+        config_ints_cpu = self._config_int_hash(configs)
         config_hash = {config_ints_cpu[i]: i for i in range(n_configs)}
 
-        # Encode connected configs
-        connected_ints = (all_connected.long() * self._powers_gpu).sum(dim=1)
-        connected_ints_cpu = connected_ints.cpu().tolist()
+        # Encode connected configs (overflow-safe)
+        connected_ints_cpu = self._config_int_hash(all_connected)
         batch_indices_cpu = batch_indices.cpu().tolist()
 
         all_rows = []

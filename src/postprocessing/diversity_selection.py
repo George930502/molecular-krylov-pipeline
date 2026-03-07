@@ -73,19 +73,61 @@ def compute_hamming_distance(
 def bitpack_configs(configs: torch.Tensor) -> torch.Tensor:
     """Pack binary configs into int64 for O(1) Hamming via XOR + popcount.
 
-    Each config (up to 64 sites) is packed into a single int64.
-    Hamming distance = popcount(a XOR b).
+    For sites <= 64: each config is packed into a single int64, returns (n,).
+    At 64 sites, the sign bit (bit 63) is used, producing negative values --
+    this is correct for XOR+popcount since those operate on bit patterns.
+
+    For sites > 64: configs are split into ceil(sites/64) words, returns (n, num_words).
+    Hamming distance = sum of popcount(a_word XOR b_word) for each word.
+    Use ``bitpacked_hamming`` for computing Hamming distances from packed tensors.
 
     Args:
-        configs: (n, sites) binary tensor, sites <= 64
+        configs: (n, sites) binary tensor
 
     Returns:
-        (n,) int64 tensor of packed configs
+        (n,) int64 tensor if sites <= 64, or (n, num_words) int64 tensor if sites > 64
     """
     n, sites = configs.shape
-    assert sites <= 64, f"Bitpacking supports up to 64 sites, got {sites}"
-    powers = (1 << torch.arange(sites, dtype=torch.int64, device=configs.device)).flip(0)
-    return (configs.long() * powers).sum(dim=1)
+    device = configs.device
+    if sites <= 64:
+        powers = (1 << torch.arange(sites, dtype=torch.int64, device=device)).flip(0)
+        return (configs.long() * powers).sum(dim=1)
+    else:
+        # Split into 64-bit words. XOR+popcount works on bit patterns,
+        # so the sign bit is fine.
+        word_size = 64
+        num_words = (sites + word_size - 1) // word_size
+        words = []
+        for w in range(num_words):
+            start = w * word_size
+            end = min(start + word_size, sites)
+            chunk_size = end - start
+            powers = (1 << torch.arange(chunk_size, dtype=torch.int64, device=device)).flip(0)
+            words.append((configs[:, start:end].long() * powers).sum(dim=1))
+        return torch.stack(words, dim=1)
+
+
+def bitpacked_hamming(
+    packed: torch.Tensor, idx_a: torch.Tensor, idx_b: torch.Tensor
+) -> torch.Tensor:
+    """Compute Hamming distances between bitpacked config pairs.
+
+    Works for both single-word (n,) and multi-word (n, num_words) packed tensors.
+
+    Args:
+        packed: packed configs from ``bitpack_configs``
+        idx_a: (k,) indices for first set of configs
+        idx_b: (k,) indices for second set of configs
+
+    Returns:
+        (k,) int32 tensor of Hamming distances
+    """
+    if packed.dim() == 1:
+        xor = packed[idx_a] ^ packed[idx_b]
+        return _popcount_int64(xor)
+    else:
+        xor = packed[idx_a] ^ packed[idx_b]  # (k, num_words)
+        return sum(_popcount_int64(xor[:, w]) for w in range(xor.shape[1]))
 
 
 def hamming_bitpacked(a, b) -> int:
@@ -101,9 +143,15 @@ def hamming_bitpacked(a, b) -> int:
 
 
 def hamming_bitpacked_batch(packed: torch.Tensor, idx: int, indices: torch.Tensor) -> torch.Tensor:
-    """Hamming distance from packed[idx] to packed[indices]. Vectorized O(k)."""
+    """Hamming distance from packed[idx] to packed[indices]. Vectorized O(k).
+
+    Works for both single-word (n,) and multi-word (n, num_words) packed tensors.
+    """
     xor = packed[indices] ^ packed[idx]
-    return _popcount_int64(xor)
+    if packed.dim() == 1:
+        return _popcount_int64(xor)
+    else:
+        return sum(_popcount_int64(xor[:, w]) for w in range(xor.shape[1]))
 
 
 # Byte-level popcount lookup table (0-255)
@@ -136,6 +184,21 @@ def _popcount_int64(x: torch.Tensor) -> torch.Tensor:
     if was_scalar:
         result = result.squeeze(0)
     return result
+
+
+def _hamming_from_one(packed: torch.Tensor, idx: int) -> torch.Tensor:
+    """Compute Hamming distances from packed[idx] to all rows.
+
+    Works for both single-word (n,) and multi-word (n, num_words) packed tensors.
+
+    Returns:
+        (n,) int32 tensor of distances
+    """
+    xor = packed ^ packed[idx]
+    if packed.dim() == 1:
+        return _popcount_int64(xor)
+    else:
+        return sum(_popcount_int64(xor[:, w]) for w in range(xor.shape[1]))
 
 
 def stochastic_greedy_select(
@@ -194,8 +257,7 @@ def stochastic_greedy_select(
     selected_mask[first] = True
 
     # Update min_dists from first selected — vectorized
-    xor = packed ^ packed[first]
-    dists = _popcount_int64(xor)
+    dists = _hamming_from_one(packed, first)
     min_dists = dists
     min_dists[first] = 0  # self-distance irrelevant, masked by selected_mask
 
@@ -228,8 +290,7 @@ def stochastic_greedy_select(
         selected_mask[best_idx] = True
 
         # Update min_dists incrementally — vectorized XOR + popcount
-        xor = packed ^ packed[best_idx]
-        new_dists = _popcount_int64(xor)
+        new_dists = _hamming_from_one(packed, best_idx)
         min_dists = torch.minimum(min_dists, new_dists)
 
     return torch.tensor(selected, dtype=torch.long)
@@ -477,14 +538,31 @@ class DiversitySelector:
         all_configs: torch.Tensor,
         subset_configs: torch.Tensor,
     ) -> torch.Tensor:
-        """Find indices of subset_configs in all_configs."""
-        indices = []
-        for i in range(len(subset_configs)):
-            matches = (all_configs == subset_configs[i]).all(dim=1)
-            idx = torch.where(matches)[0]
-            if len(idx) > 0:
-                indices.append(idx[0].item())
-        return torch.tensor(indices, device=all_configs.device)
+        """Find indices of subset_configs in all_configs.
+
+        Uses hash-based O(n + m) lookup instead of O(n * m) pairwise comparison.
+        Overflow-safe: handles n_sites >= 64 via config_integer_hash.
+        """
+        n_sub = len(subset_configs)
+        if n_sub == 0:
+            return torch.tensor([], dtype=torch.long, device=all_configs.device)
+
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
+
+        all_hashes = config_integer_hash(all_configs)
+        sub_hashes = config_integer_hash(subset_configs)
+
+        hash_to_idx: dict = {}
+        for i, h in enumerate(all_hashes):
+            if h not in hash_to_idx:
+                hash_to_idx[h] = i
+
+        indices = [hash_to_idx[h] for h in sub_hashes if h in hash_to_idx]
+
+        return torch.tensor(indices, dtype=torch.long, device=all_configs.device)
 
     def _weighted_select(
         self,
@@ -597,8 +675,7 @@ def analyze_basis_diversity(
             # Re-draw pairs where idx_a == idx_b
             same = idx_a == idx_b
             idx_b[same] = (idx_b[same] + 1) % n
-            xor = packed[idx_a] ^ packed[idx_b]
-            pairwise_dists = _popcount_int64(xor)
+            pairwise_dists = bitpacked_hamming(packed, idx_a, idx_b)
 
         dist_stats = {
             'mean_distance': pairwise_dists.float().mean().item(),

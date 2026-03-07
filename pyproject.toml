@@ -73,6 +73,9 @@ markers = [
     "slow: marks tests as slow (deselected by default, run with -m slow)",
     "molecular: marks tests requiring PySCF molecular Hamiltonians",
 ]
+filterwarnings = [
+    "ignore::UserWarning:torch.cuda",
+]
 
 [tool.black]
 line-length = 100

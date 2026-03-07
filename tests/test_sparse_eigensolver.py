@@ -287,5 +287,169 @@ class TestSparseGroundState:
         )
 
 
+class TestScipyExpmMultiply:
+    """Test _expm_multiply_step dispatches correctly and produces accurate results."""
+
+    @pytest.mark.molecular
+    def test_expm_step_dense_matches_gpu(self, lih_hamiltonian):
+        """_expm_multiply_step with dense torch tensor should match gpu_expm_multiply."""
+        from krylov.skqd import FlowGuidedSKQD, SKQDConfig
+        from utils.gpu_linalg import gpu_expm_multiply
+
+        config = SKQDConfig()
+        skqd = FlowGuidedSKQD.__new__(FlowGuidedSKQD)
+        skqd.config = config
+        skqd.time_step = 0.5
+
+        H = lih_hamiltonian
+        # Build a small dense H
+        configs = torch.tensor([
+            [1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0],
+            [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0],
+            [0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0],
+        ], dtype=torch.long)
+        H_dense = H.matrix_elements(configs, configs).to(torch.complex128)
+        H_dense = 0.5 * (H_dense + H_dense.conj().T)
+
+        psi = torch.ones(4, dtype=torch.complex128) / 2.0
+
+        result_gpu = gpu_expm_multiply(H_dense, psi, t=-1j * 0.5)
+        result_step = skqd._expm_multiply_step(H_dense, psi, 0.5)
+
+        np.testing.assert_allclose(
+            result_step.cpu().numpy(), result_gpu.cpu().numpy(), atol=1e-12,
+            err_msg="_expm_multiply_step dense path doesn't match gpu_expm_multiply"
+        )
+
+    @pytest.mark.molecular
+    def test_expm_step_sparse_matches_dense(self, lih_hamiltonian):
+        """_expm_multiply_step with scipy CSR should match dense path."""
+        from krylov.skqd import FlowGuidedSKQD, SKQDConfig
+        from scipy.sparse import csr_matrix
+        from utils.gpu_linalg import gpu_expm_multiply
+
+        config = SKQDConfig()
+        skqd = FlowGuidedSKQD.__new__(FlowGuidedSKQD)
+        skqd.config = config
+        skqd.time_step = 0.5
+
+        H = lih_hamiltonian
+        configs = torch.tensor([
+            [1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0],
+            [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0],
+            [0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0],
+        ], dtype=torch.long)
+        H_dense = H.matrix_elements(configs, configs).cpu().numpy().astype(np.float64)
+        H_dense = 0.5 * (H_dense + H_dense.T)
+        H_csr = csr_matrix(H_dense)
+        H_torch = torch.from_numpy(H_dense).to(torch.complex128)
+
+        psi = torch.ones(4, dtype=torch.complex128) / 2.0
+
+        # Dense reference via gpu_expm_multiply
+        result_dense = gpu_expm_multiply(H_torch, psi, t=-1j * 0.5)
+        # Sparse via scipy expm_multiply
+        result_sparse = skqd._expm_multiply_step(H_csr, psi, 0.5)
+
+        np.testing.assert_allclose(
+            result_sparse.cpu().numpy(), result_dense.cpu().numpy(), atol=1e-10,
+            err_msg="scipy expm_multiply doesn't match dense gpu_expm_multiply"
+        )
+
+    @pytest.mark.molecular
+    def test_build_hamiltonian_returns_csr_for_large_basis(self, lih_hamiltonian):
+        """_build_hamiltonian_in_basis_gpu should return scipy CSR for n >= threshold."""
+        from krylov.skqd import FlowGuidedSKQD, SKQDConfig
+        from scipy.sparse import issparse
+        from itertools import combinations
+
+        H = lih_hamiltonian
+        n_orb = H.n_orbitals
+
+        # Build full LiH basis (225 configs)
+        configs = []
+        for ac in combinations(range(n_orb), H.n_alpha):
+            for bc in combinations(range(n_orb), H.n_beta):
+                c = torch.zeros(H.num_sites, dtype=torch.long)
+                for i in ac:
+                    c[i] = 1
+                for i in bc:
+                    c[i + n_orb] = 1
+                configs.append(c)
+        basis = torch.stack(configs)
+
+        config = SKQDConfig()
+        skqd = FlowGuidedSKQD.__new__(FlowGuidedSKQD)
+        skqd.config = config
+        skqd.hamiltonian = H
+
+        # Temporarily lower threshold to force sparse path
+        old_threshold = FlowGuidedSKQD.KRYLOV_SPARSE_THRESHOLD
+        FlowGuidedSKQD.KRYLOV_SPARSE_THRESHOLD = 100
+        try:
+            H_result = skqd._build_hamiltonian_in_basis_gpu(basis)
+            assert issparse(H_result), (
+                f"Expected scipy sparse for n={len(basis)} >= threshold=100, "
+                f"got {type(H_result)}"
+            )
+        finally:
+            FlowGuidedSKQD.KRYLOV_SPARSE_THRESHOLD = old_threshold
+
+    @pytest.mark.molecular
+    def test_build_hamiltonian_returns_dense_for_small_basis(self, lih_hamiltonian):
+        """_build_hamiltonian_in_basis_gpu should return dense torch for n < threshold."""
+        from krylov.skqd import FlowGuidedSKQD, SKQDConfig
+
+        H = lih_hamiltonian
+        configs = torch.tensor([
+            [1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0],
+            [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0],
+        ], dtype=torch.long)
+
+        config = SKQDConfig()
+        skqd = FlowGuidedSKQD.__new__(FlowGuidedSKQD)
+        skqd.config = config
+        skqd.hamiltonian = H
+
+        H_result = skqd._build_hamiltonian_in_basis_gpu(configs)
+        assert isinstance(H_result, torch.Tensor), (
+            f"Expected torch.Tensor for small basis, got {type(H_result)}"
+        )
+        assert not H_result.is_sparse, "Should be dense torch.Tensor"
+
+    @pytest.mark.molecular
+    def test_sparse_expm_preserves_norm(self, lih_hamiltonian):
+        """Time evolution via scipy expm_multiply should preserve state norm."""
+        from krylov.skqd import FlowGuidedSKQD, SKQDConfig
+        from scipy.sparse import csr_matrix
+
+        H = lih_hamiltonian
+        configs = torch.tensor([
+            [1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0],
+            [1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0],
+            [0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0],
+            [0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0],
+        ], dtype=torch.long)
+        H_dense = H.matrix_elements(configs, configs).cpu().numpy().astype(np.float64)
+        H_dense = 0.5 * (H_dense + H_dense.T)
+        H_csr = csr_matrix(H_dense)
+
+        config = SKQDConfig()
+        skqd = FlowGuidedSKQD.__new__(FlowGuidedSKQD)
+        skqd.config = config
+        skqd.time_step = 0.5
+
+        psi = torch.ones(4, dtype=torch.complex128) / 2.0
+        for _ in range(10):
+            psi = skqd._expm_multiply_step(H_csr, psi, 0.5)
+
+        norm = torch.linalg.norm(psi).item()
+        assert abs(norm - 1.0) < 1e-10, (
+            f"Norm drifted to {norm} after 10 time steps (should be ~1.0)"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

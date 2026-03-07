@@ -155,6 +155,7 @@ class PipelineConfig:
     time_step: float = 0.1
     shots_per_krylov: int = 50000
     skqd_regularization: float = 1e-8  # Regularization for numerical stability
+    max_diag_basis_size: int = 15000  # Max basis for diag (matches SKQDConfig default)
     skip_skqd: bool = False  # Skip Krylov refinement (for NF-only mode comparison)
 
     # Training mode
@@ -167,16 +168,19 @@ class PipelineConfig:
 
     # Direct-CI mode: skip NF-NQS training entirely
     # When True, pipeline uses essential configs (HF + singles + doubles) → subspace diagonalization
-    skip_nf_training: bool = False
+    # None = auto (let adapt_to_system_size decide based on system size)
+    skip_nf_training: Optional[bool] = None
 
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     def __post_init__(self):
-        # Track if user explicitly set skip_nf_training (non-default value)
+        # Track if user explicitly set skip_nf_training (True or False)
         # so adapt_to_system_size() won't override their choice.
-        if self.skip_nf_training:
+        if self.skip_nf_training is not None:
             self._user_set_skip_nf = True
+        else:
+            self.skip_nf_training = False  # Resolve None to default False
 
     # === PERFORMANCE OPTIMIZATIONS FOR LARGE SYSTEMS ===
     # These dramatically reduce training time for large molecules (>20 qubits)
@@ -238,10 +242,13 @@ class PipelineConfig:
                         f"Direct-CI mode: {n_valid_configs:,} configs <= 20K threshold"
                     )
             else:
-                print(
-                    f"NF training enabled: {n_valid_configs:,} configs exceeds "
-                    f"Direct-CI threshold (20K)"
-                )
+                if hasattr(self, "_user_set_skip_nf"):
+                    print("NF training enabled: user override (skip_nf_training=False)")
+                else:
+                    print(
+                        f"NF training enabled: {n_valid_configs:,} configs exceeds "
+                        f"Direct-CI threshold (20K)"
+                    )
 
         if tier == "small":
             # Small systems: default parameters are fine
@@ -265,6 +272,7 @@ class PipelineConfig:
             # Large systems: aggressive basis collection
             self.max_accumulated_basis = min(n_valid_configs, 12288)
             self.max_diverse_configs = min(n_valid_configs, 8192)
+            self.max_diag_basis_size = 25000
             # Larger networks
             self.nqs_hidden_dims = [512, 512, 512, 512, 512]
             # More training
@@ -280,6 +288,7 @@ class PipelineConfig:
             # Very large systems (>20K valid configs, e.g. C2H4 with 9M)
             self.max_accumulated_basis = 16384
             self.max_diverse_configs = min(n_valid_configs, 12288)
+            self.max_diag_basis_size = 50000
 
             # Network capacity
             self.nqs_hidden_dims = [512, 512, 512, 512]
@@ -729,6 +738,7 @@ class FlowGuidedKrylovPipeline:
             shots_per_krylov=cfg.shots_per_krylov,
             use_gpu=(self.device == "cuda"),
             regularization=getattr(cfg, 'skqd_regularization', 1e-8),
+            max_diag_basis_size=cfg.max_diag_basis_size,
         )
 
         skqd = FlowGuidedSKQD(

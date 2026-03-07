@@ -780,15 +780,16 @@ class PhysicsGuidedFlowTrainer:
                         all_probs = torch.exp(2 * all_log_amp)
 
                     # Identify which configs are NOT in essential set using integer encoding
-                    n_sites = configs.shape[1]
-                    powers = (2 ** torch.arange(n_sites, device=configs.device, dtype=torch.long)).flip(0)
-                    all_ints = (configs.long() * powers).sum(dim=1)
-                    ess_ints = (self._essential_configs.long() * powers).sum(dim=1)
-                    ess_set = set(ess_ints.cpu().tolist())
+                    # Overflow-safe: handles n_sites >= 64
+                    from utils.config_hash import config_integer_hash
+
+                    all_ints = config_integer_hash(configs)
+                    ess_ints = config_integer_hash(self._essential_configs)
+                    ess_set = set(ess_ints)
 
                     # Mask for non-essential configs
                     non_ess_mask = torch.tensor(
-                        [int(x) not in ess_set for x in all_ints.cpu().tolist()],
+                        [x not in ess_set for x in all_ints],
                         device=configs.device, dtype=torch.bool,
                     )
 
@@ -1183,48 +1184,39 @@ class PhysicsGuidedFlowTrainer:
             # First call: initialize with essential configs
             new_configs = torch.cat([self._essential_configs, new_configs], dim=0)
 
-        # Use integer hash for fast deduplication
-        # Note: CUDA doesn't support matmul for Long tensors, so we use float64
-        # which has enough precision for exact integers up to 2^53
-        if num_sites <= 52:
-            powers = (2.0 ** torch.arange(num_sites - 1, -1, -1, device=device, dtype=torch.float64))
+        # Use overflow-safe integer hash for fast deduplication
+        # Handles n_sites >= 64 (40+ orbitals) without int64 overflow
+        from utils.config_hash import config_integer_hash
 
-            if self.accumulated_basis is None:
-                # First batch: just deduplicate new_configs
-                keys = (new_configs.double() @ powers).long().tolist()
-                seen = {}
-                unique_indices = []
-                for i, k in enumerate(keys):
-                    if k not in seen:
-                        seen[k] = True
-                        unique_indices.append(i)
-                self.accumulated_basis = new_configs[unique_indices]
-            else:
-                # Compute keys for existing basis
-                existing_keys = (self.accumulated_basis.double() @ powers).long().tolist()
-                existing_set = set(existing_keys)
-
-                # Find new unique configs
-                new_keys = (new_configs.double() @ powers).long().tolist()
-                new_unique_indices = []
-                for i, k in enumerate(new_keys):
-                    if k not in existing_set:
-                        existing_set.add(k)
-                        new_unique_indices.append(i)
-
-                # Append new unique configs
-                if new_unique_indices:
-                    self.accumulated_basis = torch.cat([
-                        self.accumulated_basis,
-                        new_configs[new_unique_indices]
-                    ], dim=0)
+        if self.accumulated_basis is None:
+            # First batch: just deduplicate new_configs
+            keys = config_integer_hash(new_configs)
+            seen = {}
+            unique_indices = []
+            for i, k in enumerate(keys):
+                if k not in seen:
+                    seen[k] = True
+                    unique_indices.append(i)
+            self.accumulated_basis = new_configs[unique_indices]
         else:
-            # For very large systems, fall back to torch.unique
-            if self.accumulated_basis is None:
-                self.accumulated_basis = torch.unique(new_configs, dim=0)
-            else:
-                combined = torch.cat([self.accumulated_basis, new_configs], dim=0)
-                self.accumulated_basis = torch.unique(combined, dim=0)
+            # Compute keys for existing basis
+            existing_keys = config_integer_hash(self.accumulated_basis)
+            existing_set = set(existing_keys)
+
+            # Find new unique configs
+            new_keys = config_integer_hash(new_configs)
+            new_unique_indices = []
+            for i, k in enumerate(new_keys):
+                if k not in existing_set:
+                    existing_set.add(k)
+                    new_unique_indices.append(i)
+
+            # Append new unique configs
+            if new_unique_indices:
+                self.accumulated_basis = torch.cat([
+                    self.accumulated_basis,
+                    new_configs[new_unique_indices]
+                ], dim=0)
 
         # Prune if too large - keep essential configs + random subset of the rest
         if len(self.accumulated_basis) > max_size:
@@ -1233,11 +1225,8 @@ class PhysicsGuidedFlowTrainer:
                 # Previous bug: random pruning could lose these, causing NF to explore
                 # wrong region of Hilbert space for large systems like C2H4
                 n_essential = len(self._essential_configs)
-                n_sites = self.accumulated_basis.shape[1]
-                powers = (2.0 ** torch.arange(n_sites - 1, -1, -1, device=device, dtype=torch.float64))
-
-                ess_ints = set((self._essential_configs.double() @ powers).long().tolist())
-                acc_ints = (self.accumulated_basis.double() @ powers).long().tolist()
+                ess_ints = set(config_integer_hash(self._essential_configs))
+                acc_ints = config_integer_hash(self.accumulated_basis)
 
                 essential_mask = torch.tensor(
                     [k in ess_ints for k in acc_ints], dtype=torch.bool, device=device

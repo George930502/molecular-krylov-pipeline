@@ -108,5 +108,102 @@ class TestPipelineDirectCI:
         assert error_mha < 5.0, f"LiH SQD error {error_mha:.4f} mHa too large"
 
 
+class TestMaxDiagBasisSizeWiring:
+    """Test that max_diag_basis_size is wired from PipelineConfig to SKQDConfig (Bug H2)."""
+
+    def test_pipeline_config_has_max_diag_basis_size_default(self):
+        config = PipelineConfig(device="cpu")
+        assert config.max_diag_basis_size == 15000
+
+    def test_adapt_scales_max_diag_basis_size_very_large(self):
+        config = PipelineConfig(device="cpu")
+        config.adapt_to_system_size(100000, verbose=False)
+        assert config.max_diag_basis_size == 50000
+
+    def test_adapt_scales_max_diag_basis_size_large(self):
+        config = PipelineConfig(device="cpu")
+        config.adapt_to_system_size(15000, verbose=False)
+        assert config.max_diag_basis_size == 25000
+
+    def test_adapt_keeps_max_diag_basis_size_small(self):
+        config = PipelineConfig(device="cpu")
+        config.adapt_to_system_size(500, verbose=False)
+        assert config.max_diag_basis_size == 15000
+
+    @pytest.mark.molecular
+    def test_max_diag_basis_size_wired_to_skqd(self, h2_hamiltonian):
+        """max_diag_basis_size from PipelineConfig must reach SKQDConfig."""
+        from krylov.skqd import SKQDConfig
+
+        config = PipelineConfig(device="cpu", skip_nf_training=True, max_diag_basis_size=42000)
+        pipeline = FlowGuidedKrylovPipeline(h2_hamiltonian, config=config, auto_adapt=False)
+        cfg = pipeline.config
+        skqd_config = SKQDConfig(
+            max_krylov_dim=cfg.max_krylov_dim,
+            time_step=cfg.time_step,
+            shots_per_krylov=cfg.shots_per_krylov,
+            use_gpu=False,
+            regularization=getattr(cfg, "skqd_regularization", 1e-8),
+            max_diag_basis_size=cfg.max_diag_basis_size,
+        )
+        assert skqd_config.max_diag_basis_size == 42000
+
+
+class TestPipelineConfigNFOverride:
+    """Test that skip_nf_training explicit overrides are preserved by adapt_to_system_size."""
+
+    def test_default_none_resolves_to_false(self):
+        """Default PipelineConfig() should resolve skip_nf_training to False."""
+        config = PipelineConfig()
+        assert config.skip_nf_training is False
+
+    def test_explicit_true_sets_override_flag(self):
+        """PipelineConfig(skip_nf_training=True) should set _user_set_skip_nf."""
+        config = PipelineConfig(skip_nf_training=True)
+        assert hasattr(config, "_user_set_skip_nf")
+        assert config._user_set_skip_nf is True
+
+    def test_explicit_false_sets_override_flag(self):
+        """PipelineConfig(skip_nf_training=False) should set _user_set_skip_nf."""
+        config = PipelineConfig(skip_nf_training=False)
+        assert hasattr(config, "_user_set_skip_nf")
+        assert config._user_set_skip_nf is True
+
+    def test_default_has_no_override_flag(self):
+        """Default PipelineConfig() should NOT set _user_set_skip_nf."""
+        config = PipelineConfig()
+        assert not hasattr(config, "_user_set_skip_nf")
+
+    def test_adapt_preserves_explicit_false(self):
+        """adapt_to_system_size should NOT override explicit skip_nf_training=False."""
+        config = PipelineConfig(skip_nf_training=False)
+        # Small system would normally force skip_nf_training=True
+        config.adapt_to_system_size(100, verbose=False)
+        assert config.skip_nf_training is False, (
+            "adapt_to_system_size overrode explicit skip_nf_training=False"
+        )
+
+    def test_adapt_preserves_explicit_true(self):
+        """adapt_to_system_size should NOT override explicit skip_nf_training=True."""
+        config = PipelineConfig(skip_nf_training=True)
+        # Large system would normally enable NF
+        config.adapt_to_system_size(100000, verbose=False)
+        assert config.skip_nf_training is True, (
+            "adapt_to_system_size overrode explicit skip_nf_training=True"
+        )
+
+    def test_adapt_auto_enables_nf_for_large(self):
+        """Default config with large system should auto-enable NF."""
+        config = PipelineConfig()
+        config.adapt_to_system_size(100000, verbose=False)
+        assert config.skip_nf_training is False
+
+    def test_adapt_auto_disables_nf_for_small(self):
+        """Default config with small system should auto-disable NF."""
+        config = PipelineConfig()
+        config.adapt_to_system_size(100, verbose=False)
+        assert config.skip_nf_training is True
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

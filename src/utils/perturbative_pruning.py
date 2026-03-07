@@ -51,6 +51,28 @@ def compute_mp2_amplitudes(hamiltonian) -> tuple[np.ndarray, float]:
             f"Got n_alpha={integrals.n_alpha}, n_beta={integrals.n_beta}"
         )
 
+    # MP2 assumes canonical HF orbitals where the Fock matrix is diagonal.
+    # CASSCF active-space orbitals are NOT eigenstates of the Fock operator,
+    # so the Fock diagonal reconstruction gives wrong orbital energies.
+    # Detect this by building the full Fock matrix and checking diagonality.
+    h1e_f64 = h1e.astype(np.float64)
+    h2e_f64_check = h2e.astype(np.float64)
+    n_orb_check = integrals.n_orbitals
+    n_occ_check = integrals.n_alpha
+    fock = h1e_f64.copy()
+    for p in range(n_orb_check):
+        for q in range(n_orb_check):
+            for j in range(n_occ_check):
+                fock[p, q] += 2.0 * h2e_f64_check[p, q, j, j] - h2e_f64_check[p, j, j, q]
+    fock_off_diag = fock - np.diag(np.diag(fock))
+    max_fock_off_diag = float(np.max(np.abs(fock_off_diag)))
+    if max_fock_off_diag > 1e-6:
+        raise ValueError(
+            f"MP2 pruning requires canonical (HF) orbitals where the Fock matrix "
+            f"is diagonal. Fock off-diagonal elements up to {max_fock_off_diag:.2e}. "
+            f"This typically happens with CASSCF active-space integrals."
+        )
+
     n_occ = integrals.n_alpha  # For RHF, n_alpha == n_beta
     n_orb = integrals.n_orbitals
     n_vir = n_orb - n_occ

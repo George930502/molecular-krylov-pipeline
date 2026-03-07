@@ -49,7 +49,7 @@ def gpu_eigh(
 
     # Use float64 for numerical precision
     if dtype not in (torch.float64, torch.complex128):
-        H = H.double()
+        H = H.to(torch.complex128) if H.is_complex() else H.double()
 
     # Ensure Hermitian (symmetrize for numerical stability)
     if H.is_complex():

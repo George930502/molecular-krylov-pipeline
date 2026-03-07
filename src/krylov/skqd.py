@@ -809,9 +809,12 @@ class SampleBasedKrylovDiagonalization:
             H = 0.5 * (H + H.T)
 
         # Add small regularization to improve conditioning
-        # NOTE: This shifts ALL eigenvalues up by regularization amount
+        # This shifts ALL eigenvalues up by regularization — subtracted after eigsolve
         if regularization > 0:
             H = H + regularization * torch.eye(n, dtype=H.dtype, device=H.device)
+            energy_shift = regularization
+        else:
+            energy_shift = 0.0
 
         # Check matrix conditioning
         try:
@@ -850,6 +853,9 @@ class SampleBasedKrylovDiagonalization:
             eigenvalues, eigenvectors = np.linalg.eigh(H_np)
             E0 = float(eigenvalues[0])
             v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
+
+        # Subtract regularization shift to recover true eigenvalue
+        E0 -= energy_shift
 
         if return_eigenvector:
             return E0, v0
@@ -1181,12 +1187,31 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         """
         device = self.hamiltonian.device if hasattr(self.hamiltonian, 'device') else 'cpu'
 
+        # Cache MP2 t2 amplitudes for importance-ranked config discovery
+        self._mp2_t2 = None
+        if hasattr(self.hamiltonian, 'integrals') and hasattr(self.hamiltonian, 'n_alpha'):
+            if self.hamiltonian.n_alpha == getattr(self.hamiltonian, 'n_beta', None):
+                try:
+                    try:
+                        from utils.perturbative_pruning import compute_mp2_amplitudes
+                    except ImportError:
+                        from ..utils.perturbative_pruning import compute_mp2_amplitudes
+                    self._mp2_t2, e_mp2 = compute_mp2_amplitudes(self.hamiltonian)
+                    print(f"  MP2 pruning enabled (E_MP2_corr = {e_mp2:.6f} Ha)")
+                except Exception as e:
+                    print(f"  MP2 pruning unavailable: {e}")
+
         # Start with NF basis as the subspace
         current_basis = self.nf_basis.clone().to(device)
         n_initial = len(current_basis)
+        n_sites = current_basis.shape[1]
 
-        # Create index mapping
-        basis_set = {tuple(c.cpu().tolist()) for c in current_basis}
+        # Create index mapping using overflow-safe integer encoding
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
+        basis_set = set(config_integer_hash(current_basis))
 
         # Cap total expansion to max_diag_basis_size to avoid huge matrix builds
         max_expansion = self.config.max_diag_basis_size
@@ -1221,8 +1246,8 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                     # Basis is frozen — reuse cached H to avoid expensive rebuild
                     if H_subspace_cached is None:
                         H_subspace_cached = self._build_hamiltonian_in_basis_gpu(current_basis)
-                    # GPU time evolution via gpu_expm_multiply
-                    psi = gpu_expm_multiply(H_subspace_cached, psi, t=-1j * self.time_step)
+                    # Time evolution (scipy sparse or GPU dense)
+                    psi = self._expm_multiply_step(H_subspace_cached, psi, self.time_step)
                     psi = psi / torch.linalg.norm(psi)
                     continue
 
@@ -1238,20 +1263,20 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                         new_configs = new_configs[:room]
 
                 if len(new_configs) > 0:
-                    # Add new configs to basis
+                    # Add new configs to basis (integer encoding matches _find_connected_configs)
                     current_basis = torch.cat([current_basis, new_configs], dim=0)
-                    for c in new_configs:
-                        basis_set.add(tuple(c.cpu().tolist()))
+                    new_ints = (new_configs.long() * powers).sum(dim=1).cpu().tolist()
+                    basis_set.update(new_ints)
 
                     # Expand state vector on GPU (new configs start with zero amplitude)
                     n_new = len(new_configs)
                     psi = torch.cat([psi, torch.zeros(n_new, dtype=torch.complex128, device=device)])
 
-                # Build Hamiltonian in current subspace (GPU dense tensor)
+                # Build Hamiltonian in current subspace (dense torch or sparse CSR)
                 H_subspace = self._build_hamiltonian_in_basis_gpu(current_basis)
 
-                # GPU time evolution
-                psi = gpu_expm_multiply(H_subspace, psi, t=-1j * self.time_step)
+                # Time evolution (scipy sparse or GPU dense)
+                psi = self._expm_multiply_step(H_subspace, psi, self.time_step)
 
                 # Normalize on GPU
                 psi = psi / torch.linalg.norm(psi)
@@ -1274,7 +1299,8 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         Find configurations connected to current basis but not in it.
 
         Uses configurable sampling parameters for better discovery rate.
-        Default discovery rate was ~7% (296/4144), target is >20%.
+        When MP2 t2 amplitudes are cached (via _mp2_t2), ranks discovered
+        configs by perturbative importance instead of arbitrary order.
 
         OPTIMIZED: Uses GPU-based integer encoding with single CPU transfer
         instead of per-connection CPU transfers.
@@ -1287,8 +1313,11 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         if max_new_per_step is None:
             max_new_per_step = cfg.max_new_configs_per_krylov_step
 
-        # Precompute powers of 2 on GPU for fast integer encoding
-        powers = (2 ** torch.arange(n_sites, device=device, dtype=torch.long)).flip(0)
+        # Overflow-safe integer encoding (handles n_sites >= 64)
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
 
         # Calculate how many basis states to sample
         # Use fraction-based sampling with configurable minimum
@@ -1328,40 +1357,50 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         if len(all_connected) == 0:
             return torch.empty(0, n_sites, device=device)
 
-        # GPU-based integer encoding (single operation)
-        connected_ints = (all_connected.long() * powers).sum(dim=1)
+        # Overflow-safe integer encoding (handles n_sites >= 64)
+        connected_ints_cpu = config_integer_hash(all_connected)
 
-        # Single CPU transfer for membership check
-        connected_ints_cpu = connected_ints.cpu().tolist()
-
-        # Find new configs not in basis_set
+        # Collect ALL unique new configs (not capped yet — score first)
         new_set = set()
         new_indices = []
         for i, config_int in enumerate(connected_ints_cpu):
             if config_int not in basis_set and config_int not in new_set:
                 new_set.add(config_int)
                 new_indices.append(i)
-                if len(new_indices) >= max_new_per_step:
-                    break
 
         if not new_indices:
             return torch.empty(0, n_sites, device=device)
 
-        return all_connected[new_indices]
+        new_configs = all_connected[new_indices]
+
+        # If MP2 t2 amplitudes are cached, rank by importance instead of arbitrary order
+        if len(new_configs) > max_new_per_step and hasattr(self, '_mp2_t2') and self._mp2_t2 is not None:
+            try:
+                from utils.perturbative_pruning import mp2_importance_scores, _classify_excitation
+            except ImportError:
+                from ..utils.perturbative_pruning import mp2_importance_scores, _classify_excitation
+
+            scores = mp2_importance_scores(new_configs.cpu(), self.hamiltonian)
+            _, top_indices = torch.topk(scores, min(max_new_per_step, len(scores)))
+            return new_configs[top_indices]
+
+        return new_configs[:max_new_per_step]
 
     # Threshold above which Krylov time evolution uses sparse H construction
     KRYLOV_SPARSE_THRESHOLD = 5000
 
-    def _build_hamiltonian_in_basis_gpu(self, basis: torch.Tensor) -> torch.Tensor:
+    def _build_hamiltonian_in_basis_gpu(self, basis: torch.Tensor):
         """
         Build Hamiltonian matrix in given basis for time evolution.
 
         For small bases (< KRYLOV_SPARSE_THRESHOLD), builds dense matrix on GPU.
-        For large bases, builds sparse CSR on CPU then converts to torch sparse
-        for use with Lanczos-based expm_multiply.
+        For large bases, builds sparse CSR on CPU (scipy) for direct use with
+        scipy.sparse.linalg.expm_multiply — avoids expensive torch sparse COO
+        conversion and slow PyTorch sparse matmul on ARM64.
 
         Returns:
-            Hamiltonian matrix as complex128 torch tensor (dense or sparse).
+            Dense torch.Tensor (complex128) for small bases, or
+            scipy.sparse.csr_matrix (float64) for large bases.
         """
         n = len(basis)
 
@@ -1372,7 +1411,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             H = 0.5 * (H + H.conj().T)
             return H
 
-        # Sparse path — avoids O(n^2) memory for large systems
+        # Sparse path — returns scipy CSR directly (no torch conversion)
         try:
             from scipy.sparse import coo_matrix, diags
 
@@ -1387,22 +1426,40 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             H_csr = 0.5 * (H_csr + H_csr.T)
             H_csr = H_csr + diags(diag_np, 0, shape=(n, n), format='csr')
 
-            # Convert to torch sparse COO for GPU time evolution
-            H_coo_final = H_csr.tocoo()
-            indices = torch.tensor(
-                np.vstack([H_coo_final.row, H_coo_final.col]),
-                dtype=torch.long,
-            )
-            values = torch.tensor(H_coo_final.data, dtype=torch.complex128)
-            H_sparse = torch.sparse_coo_tensor(indices, values, size=(n, n))
-            device = basis.device
-            return H_sparse.to(device)
+            return H_csr
         except Exception as e:
             print(f"  Sparse Krylov H build failed ({e}), falling back to dense")
             H = self.hamiltonian.matrix_elements(basis, basis)
             H = H.to(torch.complex128)
             H = 0.5 * (H + H.conj().T)
             return H
+
+    def _expm_multiply_step(self, H, psi: torch.Tensor, dt: float) -> torch.Tensor:
+        """
+        Compute exp(-i*dt*H) @ psi, dispatching to the best backend.
+
+        For dense torch.Tensor H: uses gpu_expm_multiply (GPU matrix_exp or Lanczos).
+        For scipy sparse CSR H: uses scipy.sparse.linalg.expm_multiply (Al-Mohy &
+        Higham algorithm). This avoids converting CSR → torch sparse COO and the
+        slow PyTorch sparse matmul on ARM64/SM121.
+
+        Args:
+            H: Hamiltonian matrix (torch.Tensor or scipy.sparse.csr_matrix)
+            psi: State vector (torch complex128)
+            dt: Time step
+
+        Returns:
+            exp(-i*dt*H) @ psi as torch complex128 tensor on same device as psi
+        """
+        from scipy.sparse import issparse
+
+        if issparse(H):
+            from scipy.sparse.linalg import expm_multiply
+            psi_np = psi.cpu().numpy()
+            result_np = expm_multiply(-1j * dt * H, psi_np)
+            return torch.from_numpy(result_np).to(device=psi.device, dtype=torch.complex128)
+        else:
+            return gpu_expm_multiply(H, psi, t=-1j * dt)
 
     def _build_hamiltonian_in_basis(self, basis: torch.Tensor):
         """
@@ -1420,11 +1477,13 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         device = basis.device
         n_sites = basis.shape[1]
 
-        # Precompute powers of 2 on GPU for fast integer encoding
-        powers = (2 ** torch.arange(n_sites, device=device, dtype=torch.long)).flip(0)
+        # Overflow-safe integer encoding (handles n_sites >= 64)
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
 
-        # Create index mapping using GPU-based integer encoding (single CPU transfer)
-        basis_ints = (basis.long() * powers).sum(dim=1).cpu().tolist()
+        basis_ints = config_integer_hash(basis)
         basis_map = {config_int: i for i, config_int in enumerate(basis_ints)}
 
         rows, cols, data = [], [], []
@@ -1448,7 +1507,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         if hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
             all_connected, all_elements, batch_idx = self.hamiltonian.get_connections_vectorized_batch(basis)
             if len(all_connected) > 0:
-                connected_ints = (all_connected.long() * powers).sum(dim=1).cpu().tolist()
+                connected_ints = config_integer_hash(all_connected)
                 batch_idx_cpu = batch_idx.cpu().tolist()
                 all_elem_cpu = all_elements.cpu().tolist() if hasattr(all_elements, 'cpu') else list(all_elements)
                 for k_idx, config_int in enumerate(connected_ints):
@@ -1463,7 +1522,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                 connected, elements = self.hamiltonian.get_connections(basis[j])
                 if len(connected) == 0:
                     continue
-                connected_ints = (connected.long() * powers).sum(dim=1).cpu().tolist()
+                connected_ints = config_integer_hash(connected)
                 for k, config_int in enumerate(connected_ints):
                     if config_int in basis_map:
                         i = basis_map[config_int]

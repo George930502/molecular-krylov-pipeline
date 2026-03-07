@@ -700,9 +700,9 @@ def verify_particle_conservation(
         'alpha_violations': alpha_violations,
         'beta_violations': beta_violations,
         'alpha_counts_mean': alpha_counts.float().mean().item(),
-        'alpha_counts_std': alpha_counts.float().std().item(),
+        'alpha_counts_std': alpha_counts.float().std(correction=0).item(),
         'beta_counts_mean': beta_counts.float().mean().item(),
-        'beta_counts_std': beta_counts.float().std().item(),
+        'beta_counts_std': beta_counts.float().std(correction=0).item(),
     }
 
     return valid, stats
