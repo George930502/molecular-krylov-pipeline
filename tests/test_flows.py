@@ -9,7 +9,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from flows.particle_conserving_flow import (
     ParticleConservingFlowSampler,
-    ParticleConservingFlow,
     GumbelTopK,
     verify_particle_conservation,
 )
@@ -55,7 +54,7 @@ class TestParticleConservingFlow:
         flow = ParticleConservingFlowSampler(
             num_sites=8, n_alpha=2, n_beta=2, hidden_dims=[32, 32]
         )
-        log_probs, unique_configs = flow.sample(n_samples=20)
+        _, unique_configs = flow.sample(n_samples=20)
 
         n_orb = 4
         alpha_counts = unique_configs[:, :n_orb].sum(dim=1)
@@ -79,14 +78,14 @@ class TestParticleConservingFlow:
             [1, 1, 0, 0, 1, 1, 0, 0],
             [1, 0, 1, 0, 0, 1, 1, 0],
         ])
-        valid, stats = verify_particle_conservation(configs, n_orbitals=4, n_alpha=2, n_beta=2)
+        valid, _ = verify_particle_conservation(configs, n_orbitals=4, n_alpha=2, n_beta=2)
         assert valid
 
         # Invalid configs (3 alpha instead of 2)
         bad_configs = torch.tensor([
             [1, 1, 1, 0, 1, 1, 0, 0],
         ])
-        valid, stats = verify_particle_conservation(bad_configs, n_orbitals=4, n_alpha=2, n_beta=2)
+        valid, _ = verify_particle_conservation(bad_configs, n_orbitals=4, n_alpha=2, n_beta=2)
         assert not valid
 
 

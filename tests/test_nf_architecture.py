@@ -11,7 +11,6 @@ References:
 
 import pytest
 import torch
-import torch.nn as nn
 import sys
 from pathlib import Path
 
@@ -45,7 +44,7 @@ class TestDeadBetaScorer:
         )
 
         # Forward pass
-        configs, log_probs = flow.flow.sample(batch_size=8, hard=False)
+        _, log_probs = flow.flow.sample(batch_size=8, hard=False)
         loss = -log_probs.mean()
         loss.backward()
 
@@ -61,28 +60,14 @@ class TestDeadBetaScorer:
 
     def test_parameter_count_reduced(self):
         """After removing beta_scorer, total params should decrease."""
-        from flows.particle_conserving_flow import (
-            ParticleConservingFlowSampler, OrbitalScoringNetwork
-        )
+        from flows.particle_conserving_flow import ParticleConservingFlowSampler
 
         flow = ParticleConservingFlowSampler(
             num_sites=12, n_alpha=2, n_beta=2,
             hidden_dims=[64, 64],
         )
-        total_params = sum(p.numel() for p in flow.parameters())
 
-        # OrbitalScoringNetwork(6, [64, 64]) has roughly:
-        # Linear(6, 64) + Linear(64, 64) + Linear(64, 6) = 384+64 + 4096+64 + 384+6 ≈ 5K
-        # So dead beta_scorer wastes ~5K params (more with [256,256])
-        # Flow should only have alpha_scorer + alpha_to_beta + beta_conditioned_scorer + gumbel_topk
-        # No standalone beta_scorer
-        scorer_params = sum(
-            p.numel() for p in OrbitalScoringNetwork(6, [64, 64]).parameters()
-        )
-
-        # After fix: total should NOT include scorer_params for dead beta_scorer
-        # This test will FAIL if beta_scorer still exists (total includes it)
-        # We check that NO parameter named 'beta_scorer.*' exists
+        # No parameter named 'beta_scorer.*' should exist
         beta_scorer_params = sum(
             p.numel() for name, p in flow.named_parameters()
             if name.startswith('beta_scorer.')
@@ -147,7 +132,10 @@ class TestGumbelTopKGradients:
 
         logits = torch.randn(4, n_orbitals, requires_grad=True)
         selection = gumbel(logits, k, hard=False)  # soft for gradient flow
-        loss = selection.sum()
+        # Use weighted loss — selection.sum() is a softmax sum (constant),
+        # so its gradient is zero. Weight positions to break symmetry.
+        weights = torch.arange(1, n_orbitals + 1, dtype=torch.float32)
+        loss = (selection * weights).sum()
         loss.backward()
 
         # ALL positions should have non-zero gradients

@@ -296,7 +296,6 @@ class PhysicsGuidedFlowTrainer:
                 ab_frac = max(0.5, n_ab_total / total_possible if total_possible > 0 else 0.5)
                 remaining_frac = 1.0 - ab_frac
                 aa_frac = remaining_frac * (n_aa_total / (n_aa_total + n_bb_total)) if (n_aa_total + n_bb_total) > 0 else 0
-                bb_frac = remaining_frac - aa_frac
                 max_ab = int(ab_frac * max_doubles)
                 max_aa = int(aa_frac * max_doubles)
                 max_bb = max_doubles - max_ab - max_aa
