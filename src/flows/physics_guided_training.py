@@ -1097,13 +1097,12 @@ class PhysicsGuidedFlowTrainer:
             config.entropy_weight * entropy
         )
 
-        # Scale by energy magnitude - MULTIPLY not divide (paper Eq. 16)
-        # Paper: L_φ = -|E[ψ_θ]|/|S| × Σ p_θ(x) × log(p̂_φ(x))
-        # The |E| factor prioritizes learning when energy is poor (high magnitude)
-        # For molecular systems with E ~ -60 to -80 Ha, this amplifies gradients
-        # We divide by |S| (number of unique configs) for normalization
-        n_unique = len(unique_configs)
-        total_loss = total_loss * torch.abs(energy.detach()) / n_unique
+        # Scale by energy magnitude (paper Eq. 16)
+        # Use batch_size as denominator (fixed), NOT |S| (unique count).
+        # |E|/|S| punishes diversity: collapsed flow (|S|=1) gets 1000x more
+        # gradient than diverse flow (|S|=1000), directly incentivizing collapse.
+        batch_size = len(configs)
+        total_loss = total_loss * torch.abs(energy.detach()) / batch_size
 
         components = {
             'teacher': teacher_loss,
