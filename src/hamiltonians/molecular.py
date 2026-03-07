@@ -25,6 +25,11 @@ try:
 except ImportError:
     NUMBA_AVAILABLE = False
 
+# Tolerance for filtering computed matrix elements.
+# All integral paths (sequential, vectorized, Numba) use FP64, so no
+# accumulation-order precision issues. 1e-12 Ha is well below chemical accuracy.
+MATRIX_ELEMENT_TOL = 1e-12
+
 # =============================================================================
 # Numba JIT-compiled functions for get_connections acceleration
 # These are module-level pure functions (no class state) for Numba compatibility.
@@ -447,8 +452,10 @@ class MolecularHamiltonian(Hamiltonian):
 
         self.device = device
         self.integrals = integrals
-        self.h1e = torch.from_numpy(integrals.h1e).float().to(device)
-        self.h2e = torch.from_numpy(integrals.h2e).float().to(device)
+        # FP64 for integrals: PySCF provides FP64 and Slater-Condon J-K subtraction
+        # suffers catastrophic cancellation in FP32. Memory is trivial (n_orb^4 * 8B).
+        self.h1e = torch.from_numpy(integrals.h1e).double().to(device)
+        self.h2e = torch.from_numpy(integrals.h2e).double().to(device)
         self.nuclear_repulsion = integrals.nuclear_repulsion
         self.n_orbitals = integrals.n_orbitals
         self.n_electrons = integrals.n_electrons
@@ -456,6 +463,7 @@ class MolecularHamiltonian(Hamiltonian):
         self.n_beta = integrals.n_beta
 
         # Pre-convert h2e to numpy ONCE (avoids GPU->CPU transfer in get_connections)
+        # Already FP64 from h2e tensor above.
         # Must be done BEFORE _precompute_vectorized_integrals which uses it
         self._h2e_np = self.h2e.cpu().numpy()
 
@@ -498,6 +506,7 @@ class MolecularHamiltonian(Hamiltonian):
         # Precompute Coulomb/Exchange tensors for single excitation Slater-Condon rules
         # J_single[p,q,r] = h2e[p,q,r,r] (Coulomb-type for excitation p<-q with spectator r)
         # K_single[p,q,r] = h2e[p,r,r,q] (Exchange-type for excitation p<-q with spectator r)
+        # Slater-Condon J/K/JK tensors (already FP64 from h2e)
         r_idx = torch.arange(n_orb, device=device)
         self._J_single = self.h2e[:, :, r_idx, r_idx]  # (n_orb, n_orb, n_orb) axes: (p, q, r)
         # h2e[:, r_idx, r_idx, :] gives axes (p, r, q) -> permute to (p, q, r)
@@ -505,7 +514,7 @@ class MolecularHamiltonian(Hamiltonian):
         # Combined tensor: J - K for same-spin contribution
         self._JK_single = self._J_single - self._K_single  # (n_orb, n_orb, n_orb)
 
-        # Numpy versions for sequential get_connections
+        # Numpy versions for sequential/Numba get_connections (FP64 from h2e)
         self._J_single_np = self._J_single.cpu().numpy()
         self._K_single_np = self._K_single.cpu().numpy()
 
@@ -544,7 +553,7 @@ class MolecularHamiltonian(Hamiltonian):
 
         self._single_p = single_p
         self._single_q = single_q
-        self._single_h1e = single_h1e
+        self._single_h1e = single_h1e  # Already FP64 from h1e
 
         # === DOUBLE EXCITATIONS: Same-spin (alpha-alpha, beta-beta) ===
         # Need all (q, s, p, r) where q < s (occupied), p < r (virtual), all distinct
@@ -750,7 +759,8 @@ class MolecularHamiltonian(Hamiltonian):
         Returns:
             (batch_size,) diagonal energies
         """
-        configs = configs.to(self.device).float()
+        dtype = self.h1e.dtype  # Match integral precision (FP64)
+        configs = configs.to(device=self.device, dtype=dtype)
         batch_size = configs.shape[0]
         n_orb = self.n_orbitals
 
@@ -760,7 +770,7 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Nuclear repulsion
         energies = torch.full((batch_size,), self.nuclear_repulsion,
-                             device=self.device, dtype=torch.float32)
+                             device=self.device, dtype=dtype)
 
         # One-body: sum_p h_pp * (n_p^alpha + n_p^beta)
         energies += (n_alpha + n_beta) @ self.h1_diag
@@ -858,7 +868,7 @@ class MolecularHamiltonian(Hamiltonian):
                 for r in occ_beta:
                     val += J_single_np[p, q, r]
 
-                if abs(val) > 1e-12:
+                if abs(val) > MATRIX_ELEMENT_TOL:
                     new_config = config_np.copy()
                     new_config[q] = 0
                     new_config[p] = 1
@@ -874,7 +884,7 @@ class MolecularHamiltonian(Hamiltonian):
                 for r in occ_alpha:
                     val += J_single_np[p, q, r]
 
-                if abs(val) > 1e-12:
+                if abs(val) > MATRIX_ELEMENT_TOL:
                     new_config = config_np.copy()
                     new_config[q + n_orb] = 0
                     new_config[p + n_orb] = 1
@@ -898,7 +908,7 @@ class MolecularHamiltonian(Hamiltonian):
                     for l in range(k + 1, n_virt_a):
                         r = virt_alpha[l]
                         val = h2e_np[p, q, r, s] - h2e_np[p, s, r, q]
-                        if abs(val) > 1e-12:
+                        if abs(val) > MATRIX_ELEMENT_TOL:
                             new_config = config_np.copy()
                             new_config[q] = 0
                             new_config[s] = 0
@@ -920,7 +930,7 @@ class MolecularHamiltonian(Hamiltonian):
                     for l in range(k + 1, n_virt_b):
                         r = virt_beta[l]
                         val = h2e_np[p, q, r, s] - h2e_np[p, s, r, q]
-                        if abs(val) > 1e-12:
+                        if abs(val) > MATRIX_ELEMENT_TOL:
                             new_config = config_np.copy()
                             q_idx = q + n_orb
                             s_idx = s + n_orb
@@ -940,7 +950,7 @@ class MolecularHamiltonian(Hamiltonian):
                 for p in virt_alpha:
                     for r in virt_beta:
                         val = h2e_np[p, q, r, s]
-                        if abs(val) > 1e-12:
+                        if abs(val) > MATRIX_ELEMENT_TOL:
                             new_config = config_np.copy()
                             s_idx = s + n_orb
                             r_idx = r + n_orb
@@ -957,7 +967,7 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Convert to torch tensors once at the end
         connected = torch.from_numpy(np.array(connected_list)).to(device)
-        elements = torch.tensor(elements_list, dtype=torch.float32, device=device)
+        elements = torch.tensor(elements_list, dtype=torch.float64, device=device)
 
         return connected, elements
 
@@ -1219,7 +1229,7 @@ class MolecularHamiltonian(Hamiltonian):
                 full_vals = h_vals + two_body
 
                 # Filter out negligible elements
-                significant = full_vals.abs() > 1e-12
+                significant = full_vals.abs() > MATRIX_ELEMENT_TOL
                 if significant.any():
                     config_idx = config_idx[significant]
                     p_orb = p_orb[significant]
@@ -1253,7 +1263,7 @@ class MolecularHamiltonian(Hamiltonian):
                 two_body = (beta_n * JK_pq).sum(dim=1) + (alpha_n * J_pq).sum(dim=1)
                 full_vals = h_vals + two_body
 
-                significant = full_vals.abs() > 1e-12
+                significant = full_vals.abs() > MATRIX_ELEMENT_TOL
                 if significant.any():
                     config_idx = config_idx[significant]
                     p_orb = p_orb[significant]
@@ -1436,9 +1446,10 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Cumulative sum of occupations (for counting occupied sites below index)
         # cumsum[i] = sum of configs[:i] (occupied sites with index < i)
+        configs_f = configs.float()
         cumsum = torch.cat([
             torch.zeros(batch_size, 1, device=device),
-            configs.cumsum(dim=1)[:, :-1]
+            configs_f.cumsum(dim=1)[:, :-1]
         ], dim=1)  # (batch, num_sites)
 
         # Gather cumsum values at each index
@@ -1447,8 +1458,7 @@ class MolecularHamiltonian(Hamiltonian):
         # 1. a_q: count = cumsum[q]
         count_q = cumsum[batch_idx, q]
 
-        # 2. a_s: count = cumsum[s] - (q < s).float() * configs[q]
-        # But configs[q] = 1 (occupied), so just - (q < s).float()
+        # 2. a_s: count = cumsum[s] - (q < s).float()
         count_s = cumsum[batch_idx, s] - (q < s).float()
 
         # 3. a+_r: count = cumsum[r] - (q < r).float() - (s < r).float()
@@ -1487,7 +1497,7 @@ class MolecularHamiltonian(Hamiltonian):
         configs = configs.to(self.device)
         n_configs = configs.shape[0]
 
-        H = torch.zeros(n_configs, n_configs, device=self.device)
+        H = torch.zeros(n_configs, n_configs, device=self.device, dtype=self.h1e.dtype)
 
         # Vectorized diagonal (already GPU-accelerated)
         H.diagonal().copy_(self.diagonal_elements_batch(configs))
@@ -1625,7 +1635,7 @@ class MolecularHamiltonian(Hamiltonian):
             return (
                 torch.tensor([], dtype=torch.long, device=device),
                 torch.tensor([], dtype=torch.long, device=device),
-                torch.tensor([], dtype=torch.float32, device=device),
+                torch.tensor([], dtype=torch.float64, device=device),
             )
 
         # Integer encoding for fast lookup
@@ -1656,13 +1666,13 @@ class MolecularHamiltonian(Hamiltonian):
             return (
                 torch.tensor([], dtype=torch.long, device=device),
                 torch.tensor([], dtype=torch.long, device=device),
-                torch.tensor([], dtype=torch.float32, device=device),
+                torch.tensor([], dtype=torch.float64, device=device),
             )
 
         return (
             torch.tensor(all_rows, dtype=torch.long, device=device),
             torch.tensor(all_cols, dtype=torch.long, device=device),
-            all_elements[torch.tensor(val_indices, device=device)].float(),
+            all_elements[torch.tensor(val_indices, device=device)],
         )
 
     def matrix_elements(

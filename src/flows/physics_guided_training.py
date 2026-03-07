@@ -931,6 +931,9 @@ class PhysicsGuidedFlowTrainer:
 
         if use_cache and self.connection_cache is not None:
             return self.connection_cache.get_batch(configs, self.hamiltonian)
+        elif hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
+            # Vectorized batch path: 30-70x faster than sequential on GPU
+            return self.hamiltonian.get_connections_vectorized_batch(configs)
         elif (config.use_parallel_connections and
               hasattr(self.hamiltonian, 'get_connections_parallel')):
             return self.hamiltonian.get_connections_parallel(
