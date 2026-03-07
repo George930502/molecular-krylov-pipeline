@@ -98,23 +98,36 @@ class TestStochasticGreedy:
 
     @pytest.mark.slow
     def test_stochastic_greedy_no_oom_50k(self):
-        """Must handle 50K configs without OOM (< 1GB memory)."""
+        """Must handle 50K configs without OOM.
+
+        Uses tracemalloc to measure incremental memory allocation, not ru_maxrss.
+        ru_maxrss is a process-level high-water mark that never decreases — prior
+        tests (e.g. CH4 pipeline building 15876x15876 dense H) inflate it to 16GB+,
+        causing false positives. tracemalloc.reset_peak() isolates this test.
+        """
         from postprocessing.diversity_selection import stochastic_greedy_select
-        import resource
+        import tracemalloc
+        import gc
 
         n = 50000
         sites = 40
         configs = torch.randint(0, 2, (n, sites), dtype=torch.long)
         weights = torch.ones(n)
 
-        rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KB on Linux
+        gc.collect()
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+
         selected = stochastic_greedy_select(configs, weights, n_select=5000)
-        rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
 
         assert len(selected) == 5000
-        # ru_maxrss is peak RSS in KB (Linux). Check total process < 4GB.
-        peak_mb = rss_after / 1024
-        assert peak_mb < 4000, f"Peak RSS {peak_mb:.0f} MB — potential OOM issue"
+        # stochastic_greedy_select is O(n) memory: ~0.2 MB measured.
+        # 200 MB threshold is very generous, catches real regressions.
+        peak_mb = peak / 1024 / 1024
+        assert peak_mb < 200, f"stochastic_greedy peak allocation {peak_mb:.1f} MB — potential OOM"
 
     @pytest.mark.molecular
     def test_stochastic_greedy_energy_quality(self, lih_hamiltonian):

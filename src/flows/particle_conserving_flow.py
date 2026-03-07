@@ -318,14 +318,15 @@ class ParticleConservingFlow(nn.Module):
         beta_layers.append(nn.Linear(in_dim, n_orbitals))
         self.beta_conditioned_scorer = nn.Sequential(*beta_layers)
 
-        # Gumbel-top-k selector
-        self.gumbel_topk = GumbelTopK(temperature)
+        # SigmoidTopK: deterministic, gradient-exact top-k via implicit differentiation.
+        # Replaces GumbelTopK which has vanishing gradients at non-selected positions.
+        self.topk_selector = SigmoidTopK(temperature)
         self.temperature = temperature
 
     def set_temperature(self, temperature: float):
         """Update temperature for Gumbel sampling."""
         self.temperature = temperature
-        self.gumbel_topk.temperature = temperature
+        self.topk_selector.temperature = temperature
 
     def sample(
         self,
@@ -347,7 +348,7 @@ class ParticleConservingFlow(nn.Module):
 
         # Sample alpha spin channel (learnable logits, no context)
         alpha_logits = self.alpha_logits.unsqueeze(0).expand(batch_size, -1)
-        alpha_config = self.gumbel_topk(alpha_logits, self.n_alpha, hard=hard)
+        alpha_config = self.topk_selector(alpha_logits, self.n_alpha, hard=hard)
 
         # Sample beta spin channel conditioned on alpha
         alpha_context = self.alpha_to_beta(alpha_config)
@@ -356,7 +357,7 @@ class ParticleConservingFlow(nn.Module):
             alpha_context
         ], dim=-1)
         beta_logits = self.beta_conditioned_scorer(beta_input)
-        beta_config = self.gumbel_topk(beta_logits, self.n_beta, hard=hard)
+        beta_config = self.topk_selector(beta_logits, self.n_beta, hard=hard)
 
         # Combine into full configuration
         configs = torch.cat([alpha_config, beta_config], dim=-1)
