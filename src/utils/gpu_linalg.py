@@ -169,10 +169,17 @@ def mixed_precision_eigh(
     elif not use_gpu and H.is_cuda:
         H = H.cpu()
 
+    n = H.shape[0]
+
     # For very small matrices (n <= 64), FP32 rounding noise is negligible
     # and the overhead of two solves isn't worth it. Use FP64 directly.
-    n = H.shape[0]
     if n <= 64:
+        return gpu_eigh(H, use_gpu=use_gpu)
+
+    # For already-FP64/complex128 input, the whole point of mixed-precision is
+    # to avoid full FP64 eigh. But if the caller explicitly provides FP64, honor it.
+    # Only apply mixed-precision when input is FP32 or lower precision.
+    if H.dtype in (torch.float64, torch.complex128):
         return gpu_eigh(H, use_gpu=use_gpu)
 
     # Determine FP32/FP64 dtype pairs based on real vs complex input

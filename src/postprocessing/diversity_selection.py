@@ -84,7 +84,7 @@ def bitpack_configs(configs: torch.Tensor) -> torch.Tensor:
     """
     n, sites = configs.shape
     assert sites <= 64, f"Bitpacking supports up to 64 sites, got {sites}"
-    powers = (1 << torch.arange(sites, dtype=torch.int64)).flip(0)
+    powers = (1 << torch.arange(sites, dtype=torch.int64, device=configs.device)).flip(0)
     return (configs.long() * powers).sum(dim=1)
 
 
@@ -121,17 +121,17 @@ def _popcount_int64(x: torch.Tensor) -> torch.Tensor:
         _POPCOUNT_TABLE_CACHE[dev] = _POPCOUNT_TABLE.to(dev)
     table = _POPCOUNT_TABLE_CACHE[dev]
 
-    # view(uint8) requires at least 1-dim; unsqueeze scalar tensors
+    # Ensure at least 1-dim; unsqueeze scalar tensors
     was_scalar = x.dim() == 0
     if was_scalar:
         x = x.unsqueeze(0)
 
-    # View as uint8 bytes (8 bytes per int64), sum popcount per byte
-    shape = x.shape
-    x_bytes = x.contiguous().view(torch.uint8)  # flatten to bytes
-    counts = table[x_bytes.long()]  # lookup each byte
-    # Reshape to (original_shape..., 8) and sum over last dim
-    counts = counts.reshape(*shape, 8).sum(dim=-1)
+    # Extract 8 bytes per int64 via bit-shifts (avoids view(dtype) which is unsupported)
+    shifts = torch.tensor(
+        [0, 8, 16, 24, 32, 40, 48, 56], device=x.device, dtype=torch.long,
+    )
+    x_bytes = ((x.unsqueeze(-1) >> shifts) & 0xFF).long()
+    counts = table[x_bytes].sum(dim=-1)
     result = counts.int()
     if was_scalar:
         result = result.squeeze(0)
