@@ -203,6 +203,62 @@ class TestSparseEigensolver:
         assert error_mha < 0.5, f"LiH error {error_mha:.4f} mHa with sparse path"
 
 
+class TestSparseHamiltonianEigsh:
+    """Test the standalone sparse_hamiltonian_eigsh utility function."""
+
+    @pytest.mark.molecular
+    def test_sparse_hamiltonian_eigsh_h2(self, h2_hamiltonian):
+        """sparse_hamiltonian_eigsh should match FCI for H2 (full space)."""
+        from utils.gpu_linalg import sparse_hamiltonian_eigsh
+
+        H = h2_hamiltonian
+        configs = torch.tensor([
+            [1, 0, 1, 0], [1, 0, 0, 1],
+            [0, 1, 1, 0], [0, 1, 0, 1],
+        ], dtype=torch.long)
+        evals, evecs = sparse_hamiltonian_eigsh(H, configs, k=2)
+        e_fci = H.fci_energy()
+        assert abs(float(evals[0]) - e_fci) < 1e-8, (
+            f"sparse_hamiltonian_eigsh {float(evals[0]):.10f} != FCI {e_fci:.10f}"
+        )
+
+    @pytest.mark.molecular
+    def test_sparse_hamiltonian_eigsh_lih(self, lih_hamiltonian):
+        """sparse_hamiltonian_eigsh should match FCI for LiH (full space)."""
+        from utils.gpu_linalg import sparse_hamiltonian_eigsh
+        from itertools import combinations
+
+        H = lih_hamiltonian
+        n_orb = H.n_orbitals
+        configs = []
+        for ac in combinations(range(n_orb), H.n_alpha):
+            for bc in combinations(range(n_orb), H.n_beta):
+                c = torch.zeros(H.num_sites, dtype=torch.long)
+                for i in ac: c[i] = 1
+                for i in bc: c[i + n_orb] = 1
+                configs.append(c)
+        basis = torch.stack(configs)
+
+        evals, evecs = sparse_hamiltonian_eigsh(H, basis, k=2)
+        e_fci = H.fci_energy()
+        assert abs(float(evals[0]) - e_fci) < 1e-8, (
+            f"sparse_hamiltonian_eigsh {float(evals[0]):.10f} != FCI {e_fci:.10f}"
+        )
+
+    @pytest.mark.molecular
+    def test_evecs_shape(self, h2_hamiltonian):
+        """Eigenvectors should have correct shape."""
+        from utils.gpu_linalg import sparse_hamiltonian_eigsh
+
+        configs = torch.tensor([
+            [1, 0, 1, 0], [1, 0, 0, 1],
+            [0, 1, 1, 0], [0, 1, 0, 1],
+        ], dtype=torch.long)
+        evals, evecs = sparse_hamiltonian_eigsh(h2_hamiltonian, configs, k=2)
+        assert evals.shape == (2,)
+        assert evecs.shape == (4, 2)
+
+
 class TestSparseGroundState:
     """Test _sparse_ground_state directly against dense eigensolver."""
 

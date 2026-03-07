@@ -12,10 +12,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 # cu130 resolves NVRTC JIT issues on GB10 (sm_121).
 # CUDA is now available for all tests by default.
 
-# Set PyTorch to use all available CPU threads
+# Set PyTorch and Numba to use all available CPU threads
+import multiprocessing
+_n_cpus = multiprocessing.cpu_count()
 if hasattr(torch, 'set_num_threads'):
-    import multiprocessing
-    torch.set_num_threads(multiprocessing.cpu_count())
+    torch.set_num_threads(_n_cpus)
+# Numba thread pool for prange and parallel=True
+os.environ.setdefault('NUMBA_NUM_THREADS', str(_n_cpus))
+# OpenMP/BLAS threads (SciPy, NumPy, PySCF)
+os.environ.setdefault('OMP_NUM_THREADS', str(_n_cpus))
+os.environ.setdefault('OPENBLAS_NUM_THREADS', str(_n_cpus))
 
 
 def pytest_configure(config):

@@ -774,11 +774,10 @@ class SampleBasedKrylovDiagonalization:
         # Cap basis size to avoid building huge dense matrices (N^2 memory)
         max_diag = self.config.max_diag_basis_size
         if max_diag > 0 and len(basis) > max_diag:
-            # Keep first max_diag configs — pipeline orders by importance:
-            # essential configs (HF+singles+doubles) first, then PT2-ranked residual
             original_size = len(basis)
-            basis = basis[:max_diag]
-            print(f"  Capped basis from {original_size} to {max_diag} configs for diagonalization")
+            basis = self._rank_and_truncate_basis(basis, max_diag)
+            print(f"  Capped basis from {original_size} to {max_diag} configs "
+                  f"(importance-ranked by diagonal energy)")
 
         n = len(basis)
         device = basis.device
@@ -810,9 +809,9 @@ class SampleBasedKrylovDiagonalization:
         # Add small regularization to improve conditioning
         # NOTE: This shifts ALL eigenvalues up by regularization amount
         if regularization > 0:
-            H = H + regularization * torch.eye(n, dtype=H.dtype, device=device)
+            H = H + regularization * torch.eye(n, dtype=H.dtype, device=H.device)
 
-        # Check matrix conditioning (on GPU)
+        # Check matrix conditioning
         try:
             # Use torch.linalg.cond for GPU-accelerated condition number
             cond = torch.linalg.cond(H).item()
@@ -906,6 +905,55 @@ class SampleBasedKrylovDiagonalization:
         else:
             return E0, None
 
+    def _rank_and_truncate_basis(
+        self,
+        basis: torch.Tensor,
+        max_size: int,
+    ) -> torch.Tensor:
+        """
+        Rank basis configs by diagonal energy and keep the lowest-energy ones.
+
+        Essential configs (HF + singles + doubles, i.e. excitation rank <= 2)
+        are always preserved regardless of their diagonal energy.
+
+        Args:
+            basis: (n_basis, n_sites) configuration tensor
+            max_size: Maximum number of configs to keep
+
+        Returns:
+            Truncated basis tensor of shape (max_size, n_sites)
+        """
+        n = len(basis)
+        if n <= max_size:
+            return basis
+
+        # Compute diagonal energies in batch (vectorized, FP64)
+        diag_energies = self.hamiltonian.diagonal_elements_batch(basis)
+
+        # Identify essential configs: excitation rank <= 2 from HF
+        hf = self.hamiltonian.get_hf_state().to(basis.device)
+        # Excitation rank = number of orbitals that differ from HF / 2
+        diffs = (basis != hf.unsqueeze(0)).sum(dim=1)  # changed orbital count
+        excitation_rank = diffs // 2  # each excitation changes 2 orbitals
+        essential_mask = excitation_rank <= 2
+
+        n_essential = essential_mask.sum().item()
+
+        if n_essential >= max_size:
+            # More essential configs than max_size — rank essentials by energy
+            essential_energies = diag_energies.clone()
+            essential_energies[~essential_mask] = float('inf')
+            _, indices = torch.sort(essential_energies)
+            return basis[indices[:max_size]]
+
+        # Protect essential configs by giving them -inf energy (always selected)
+        sort_energies = diag_energies.clone()
+        sort_energies[essential_mask] = float('-inf')
+
+        # Sort: -inf essentials come first, then by ascending energy
+        _, indices = torch.sort(sort_energies)
+        return basis[indices[:max_size]]
+
     def _sparse_ground_state(
         self,
         basis: torch.Tensor,
@@ -916,72 +964,39 @@ class SampleBasedKrylovDiagonalization:
         """
         Compute ground state using sparse Hamiltonian construction + scipy.sparse.eigsh.
 
-        Avoids O(n²) dense matrix construction for large bases.
-        Uses get_sparse_matrix_elements() for off-diagonals + diagonal_element() for diagonal.
+        Avoids O(n^2) dense matrix construction for large bases.
+        Delegates to sparse_hamiltonian_eigsh() for build + solve.
 
         Args:
             shift_invert: If True, use shift-invert mode with sigma=E_hf.
                 This finds eigenvalues near sigma via (H - sigma*I)^{-1},
                 converging faster when sigma is close to the ground state.
         """
-        from scipy.sparse import coo_matrix, csr_matrix
-        from scipy.sparse.linalg import eigsh
-
         n = len(basis)
         device = basis.device
         mode_str = "shift-invert" if shift_invert else "standard"
         print(f"  Using sparse eigensolver ({mode_str}) for {n} configs")
 
-        # Get sparse off-diagonal elements
-        rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
-        rows_np = rows.cpu().numpy()
-        cols_np = cols.cpu().numpy()
-        vals_np = vals.cpu().numpy().astype(np.float64)
-
-        # Build sparse matrix (off-diagonal)
-        H_sparse = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n))
-
-        # Add diagonal elements
-        diag_vals = np.array([
-            self.hamiltonian.diagonal_element(basis[i]).item()
-            for i in range(n)
-        ], dtype=np.float64)
-
-        if regularization > 0:
-            diag_vals += regularization
-
-        from scipy.sparse import diags
-        # get_sparse_matrix_elements already returns BOTH (i,j) and (j,i) entries.
-        # COO sums duplicates, so H_sparse already has correct off-diagonal values.
-        # Just symmetrize to handle any floating-point asymmetry, then add diagonal.
-        H_csr = H_sparse.tocsr()
-        H_csr = 0.5 * (H_csr + H_csr.T)
-        H_csr = H_csr + diags(diag_vals, 0, shape=(n, n), format='csr')
-
-        # Sparse eigensolver
         try:
-            k_eig = min(2, n - 1) if n >= 2 else 1
+            try:
+                from utils.gpu_linalg import sparse_hamiltonian_eigsh
+            except ImportError:
+                from src.utils.gpu_linalg import sparse_hamiltonian_eigsh
 
-            if shift_invert:
-                # Shift-invert: solve (H - sigma*I)^{-1} to find eigenvalues
-                # near sigma. Using which='SA' returns the algebraically smallest
-                # eigenvalues, i.e., the ground state.
-                sigma = float(self.hamiltonian.diagonal_element(
-                    self.hamiltonian.get_hf_state()
-                ).item())
-                eigenvalues, eigenvectors = eigsh(
-                    H_csr, k=k_eig, sigma=sigma, which='SA'
-                )
-                E0 = float(eigenvalues[0])
-                v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
-            else:
-                eigenvalues, eigenvectors = eigsh(H_csr, k=k_eig, which='SA')
-                E0 = float(eigenvalues[0])
-                v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
+            eigenvalues, eigenvectors = sparse_hamiltonian_eigsh(
+                self.hamiltonian, basis, k=2, which='SA',
+                shift_invert=shift_invert,
+            )
+            E0 = float(eigenvalues[0].cpu())
+            v0 = eigenvectors[:, 0] if return_eigenvector else None
         except Exception as e:
             print(f"  Sparse eigsh failed ({e}), falling back to dense")
-            H_dense = H_csr.toarray()
-            eigenvalues, eigenvectors = np.linalg.eigh(H_dense)
+            H_proj = self.hamiltonian.matrix_elements(basis, basis)
+            H_np = H_proj.cpu().numpy().astype(np.float64)
+            H_np = 0.5 * (H_np + H_np.T)
+            if regularization > 0:
+                H_np += regularization * np.eye(n)
+            eigenvalues, eigenvectors = np.linalg.eigh(H_np)
             E0 = float(eigenvalues[0])
             v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
 
@@ -1330,22 +1345,60 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         return all_connected[new_indices]
 
+    # Threshold above which Krylov time evolution uses sparse H construction
+    KRYLOV_SPARSE_THRESHOLD = 5000
+
     def _build_hamiltonian_in_basis_gpu(self, basis: torch.Tensor) -> torch.Tensor:
         """
-        Build dense Hamiltonian matrix in given basis, entirely on GPU.
+        Build Hamiltonian matrix in given basis for time evolution.
 
-        Uses hamiltonian.matrix_elements() which returns a GPU torch tensor.
-        This avoids the scipy sparse CPU path entirely.
+        For small bases (< KRYLOV_SPARSE_THRESHOLD), builds dense matrix on GPU.
+        For large bases, builds sparse CSR on CPU then converts to torch sparse
+        for use with Lanczos-based expm_multiply.
 
         Returns:
-            Dense Hamiltonian matrix (n, n) as complex128 torch tensor on device.
+            Hamiltonian matrix as complex128 torch tensor (dense or sparse).
         """
-        H = self.hamiltonian.matrix_elements(basis, basis)
-        # Ensure complex128 for time evolution compatibility
-        H = H.to(torch.complex128)
-        # Symmetrize on GPU
-        H = 0.5 * (H + H.conj().T)
-        return H
+        n = len(basis)
+
+        if n < self.KRYLOV_SPARSE_THRESHOLD:
+            # Dense path — fast for small systems
+            H = self.hamiltonian.matrix_elements(basis, basis)
+            H = H.to(torch.complex128)
+            H = 0.5 * (H + H.conj().T)
+            return H
+
+        # Sparse path — avoids O(n^2) memory for large systems
+        try:
+            from scipy.sparse import coo_matrix, diags
+
+            rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
+            rows_np = rows.cpu().numpy()
+            cols_np = cols.cpu().numpy()
+            vals_np = vals.cpu().numpy().astype(np.float64)
+
+            H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n))
+            diag_np = self.hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+            H_csr = H_coo.tocsr()
+            H_csr = 0.5 * (H_csr + H_csr.T)
+            H_csr = H_csr + diags(diag_np, 0, shape=(n, n), format='csr')
+
+            # Convert to torch sparse COO for GPU time evolution
+            H_coo_final = H_csr.tocoo()
+            indices = torch.tensor(
+                np.vstack([H_coo_final.row, H_coo_final.col]),
+                dtype=torch.long,
+            )
+            values = torch.tensor(H_coo_final.data, dtype=torch.complex128)
+            H_sparse = torch.sparse_coo_tensor(indices, values, size=(n, n))
+            device = basis.device
+            return H_sparse.to(device)
+        except Exception as e:
+            print(f"  Sparse Krylov H build failed ({e}), falling back to dense")
+            H = self.hamiltonian.matrix_elements(basis, basis)
+            H = H.to(torch.complex128)
+            H = 0.5 * (H + H.conj().T)
+            return H
 
     def _build_hamiltonian_in_basis(self, basis: torch.Tensor):
         """

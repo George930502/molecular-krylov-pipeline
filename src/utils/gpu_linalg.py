@@ -238,6 +238,78 @@ def mixed_precision_eigh(
     return evals_refined, evecs_fp64
 
 
+def sparse_hamiltonian_eigsh(
+    hamiltonian,
+    basis: torch.Tensor,
+    k: int = 2,
+    which: str = 'SA',
+    shift_invert: bool = False,
+    tol: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build projected Hamiltonian in sparse CSR format and solve with eigsh.
+
+    Never materializes the full dense matrix. Memory: O(n * avg_nnz_per_row)
+    instead of O(n^2).
+
+    For molecular Hamiltonians with Slater-Condon rules, nnz/row varies:
+    HF row ~7.8K, singles ~250, doubles ~36-50. Weighted avg ~54-128 for
+    essential-only basis. Matrix is 0.1-6% dense — highly efficient for eigsh.
+
+    Args:
+        hamiltonian: MolecularHamiltonian with get_sparse_matrix_elements()
+                     and diagonal_elements_batch() methods
+        basis: (n_basis, n_sites) configurations
+        k: Number of eigenvalues to compute
+        which: 'SA' for smallest algebraic
+        shift_invert: Use shift-invert mode with sigma=E_HF for faster convergence
+        tol: Convergence tolerance for eigsh (0 = machine precision)
+
+    Returns:
+        eigenvalues: (k,) tensor
+        eigenvectors: (n_basis, k) tensor
+    """
+    from scipy.sparse import coo_matrix, diags
+    from scipy.sparse.linalg import eigsh
+
+    n = len(basis)
+    device = basis.device
+
+    # Off-diagonal elements via vectorized batch method
+    rows, cols, vals = hamiltonian.get_sparse_matrix_elements(basis)
+    rows_np = rows.cpu().numpy()
+    cols_np = cols.cpu().numpy()
+    vals_np = vals.cpu().numpy().astype(np.float64)
+
+    H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n))
+
+    # Diagonal elements (vectorized, no Python loop)
+    diag_np = hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+
+    # Symmetrize off-diagonal + add diagonal
+    H_csr = H_coo.tocsr()
+    H_csr = 0.5 * (H_csr + H_csr.T)
+    H_csr = H_csr + diags(diag_np, 0, shape=(n, n), format='csr')
+
+    k_eig = min(k, n - 1)
+
+    if shift_invert:
+        sigma = float(hamiltonian.diagonal_element(
+            hamiltonian.get_hf_state()
+        ).item())
+        eigenvalues, eigenvectors = eigsh(
+            H_csr, k=k_eig, sigma=sigma, which='SA', tol=tol
+        )
+    else:
+        eigenvalues, eigenvectors = eigsh(
+            H_csr, k=k_eig, which=which, tol=tol
+        )
+
+    evals_t = torch.from_numpy(eigenvalues).to(device)
+    evecs_t = torch.from_numpy(eigenvectors).to(device)
+    return evals_t, evecs_t
+
+
 def gpu_expm_multiply(
     A: torch.Tensor,
     v: torch.Tensor,
@@ -268,9 +340,9 @@ def gpu_expm_multiply(
     device = v.device
     dtype = v.dtype
 
-    # For matrices that fit in GPU memory, direct matrix exponential is fastest
-    # GPU memory is typically 16-48GB, so 10k x 10k complex128 = 1.6GB is safe
-    if n < 10000:
+    # Sparse tensors must use Lanczos (matrix_exp doesn't support sparse)
+    # For small dense matrices, direct matrix exponential is fastest
+    if n < 10000 and not A.is_sparse:
         return _expm_multiply_dense(A, v, t)
 
     # For very large systems, use Krylov approximation to save memory

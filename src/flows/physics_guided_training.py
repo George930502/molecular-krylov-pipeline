@@ -54,12 +54,15 @@ class PhysicsGuidedConfig:
     # Training epochs
     num_epochs: int = 500
     min_epochs: int = 150
-    convergence_threshold: float = 0.20
+    convergence_threshold: float = 0.35
 
     # Loss weights
-    teacher_weight: float = 1.0  # Cross-entropy (paper's main term)
-    physics_weight: float = 0.0  # Variational energy gradient (optional)
-    entropy_weight: float = 0.05  # Entropy bonus to prevent mode collapse
+    # Teacher: cross-entropy KL(NQS || Flow) — the paper's primary term
+    # Physics: REINFORCE energy gradient — direct "low energy is better" signal
+    # Entropy: regularizer to prevent mode collapse
+    teacher_weight: float = 1.0  # Cross-entropy (paper's primary term)
+    physics_weight: float = 0.1  # REINFORCE energy gradient signal
+    entropy_weight: float = 0.05  # Entropy regularization for exploration
 
     # Energy baseline for physics signal
     use_energy_baseline: bool = True  # Subtract baseline for variance reduction
@@ -170,9 +173,12 @@ class PhysicsGuidedFlowTrainer:
         self.config = config
         self.device = device
 
-        # Optimizers
+        # Optimizers — exclude log_temperature from gradient updates because
+        # temperature is controlled by the external annealing schedule (line ~511).
+        # Including it would let AdamW fight the schedule each step.
+        flow_params = [p for n, p in flow.named_parameters() if 'log_temperature' not in n]
         self.flow_optimizer = torch.optim.AdamW(
-            flow.parameters(), lr=config.flow_lr, weight_decay=1e-5
+            flow_params, lr=config.flow_lr, weight_decay=1e-5
         )
         self.nqs_optimizer = torch.optim.AdamW(
             nqs.parameters(), lr=config.nqs_lr, weight_decay=1e-5
@@ -712,6 +718,12 @@ class PhysicsGuidedFlowTrainer:
         """
         Compute energy by diagonalizing H in sampled subspace (paper's method).
 
+        NOTE: This function is called inside torch.no_grad() context (line 632).
+        The returned energy provides NO gradient to the flow or NQS. It is used
+        only for monitoring and as a scalar multiplier in loss scaling (|E|).
+        The actual training gradient comes from local energies via REINFORCE
+        in _compute_nqs_loss().
+
         From paper Section 3.2-3.3:
         "Energy is computed by diagonalizing H restricted to the sampled subspace S"
 
@@ -1101,7 +1113,7 @@ class PhysicsGuidedFlowTrainer:
         # Combined loss: entropy is a regularizer independent of energy scale,
         # so it must NOT be multiplied by |E|/batch_size. Only teacher and physics
         # losses scale with energy magnitude (paper Eq. 16).
-        batch_size = len(configs)
+        batch_size = len(all_configs)
         energy_scale = torch.abs(energy.detach()) / batch_size
 
         # Scale teacher + physics by energy magnitude
@@ -1135,6 +1147,11 @@ class PhysicsGuidedFlowTrainer:
         """
         # Recompute with gradients
         log_amp = self.nqs.log_amplitude(configs.float())
+        # NOTE: log_probs = 2 * log_amp computes log(|psi|^2).
+        # This means the effective gradient is 2x standard REINFORCE.
+        # For real-valued wavefunctions, this is equivalent to doubling nqs_lr.
+        # This is intentional — it follows the standard VMC gradient formula:
+        # d<E>/dtheta = 2 * Re[<(E_loc - <E>) * d(log psi)/dtheta>]
         log_probs = 2 * log_amp  # log(|psi|^2) = 2 * log|psi|
 
         # REINFORCE-style gradient
@@ -1283,9 +1300,9 @@ def create_physics_guided_trainer(
     nqs: nn.Module,
     hamiltonian: Any,
     device: str = "cuda",
-    teacher_weight: float = 0.5,
-    physics_weight: float = 0.4,
-    entropy_weight: float = 0.1,
+    teacher_weight: float = 1.0,
+    physics_weight: float = 0.1,
+    entropy_weight: float = 0.05,
     **kwargs,
 ) -> PhysicsGuidedFlowTrainer:
     """

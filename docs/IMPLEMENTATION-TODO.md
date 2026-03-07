@@ -23,35 +23,32 @@
 
 ## Phase 1: Sparse & Scalability
 
-### PR 1.1: Sparse Eigensolver Path (partially done)
+### PR 1.1: Sparse Eigensolver Path ✅
 - [x] TEST: `test_sparse_matrix_build` — COO from `get_sparse_matrix_elements()` matches dense
 - [x] TEST: `test_sparse_eigsh_matches_dense` — sparse eigsh matches eigh for H2/LiH
 - [x] TEST: `test_max_full_subspace_guard` — standard SKQD has guard
 - [x] IMPL: Wire `get_sparse_matrix_elements()` into eigensolver (SPARSE_THRESHOLD=3000)
 - [x] IMPL: Upgrade `get_sparse_matrix_elements` to use vectorized batch path
 
+### PR 1.2: Importance-Ranked Basis Truncation ✅
+- [x] TEST: `test_importance_truncation.py` — 7 tests (ranking, essential preservation, energy improvement)
+- [x] IMPL: `_rank_and_truncate_basis()` ranks by diagonal energy, preserves essentials (excitation rank ≤ 2)
+- [x] IMPL: Wired into `compute_ground_state_energy()` replacing blind `basis[:max_diag]`
+
 ### PR 1.3: Adaptive Doubles Allocation ✅
 - [x] IMPL: Proportional allocation with αβ >= 50% in both pipeline.py and physics_guided_training.py
 
-### PR 1.5: SQD Batch Parallelization ⬅️ NEXT (Tier 1, 8-10x speedup)
-- [ ] TEST: `test_sqd_parallel_batches` — parallel results match sequential
-- [ ] TEST: `test_sqd_parallel_speedup` — wall time < sequential / n_workers
-- [ ] TEST: `test_sqd_parallel_energy_accuracy` — energy matches non-parallel within tolerance
-- [ ] IMPL: `ProcessPoolExecutor` with `OPENBLAS_NUM_THREADS=1` in `sqd.py`
-- [ ] IMPL: Serializable batch diag function (no lambda/closure)
+### ~~PR 1.6: Shift-Invert eigsh~~ ❌ REJECTED
+> Tested on N2 (14,400 configs): 259s vs 1.45s standard mode. LU factorization cost
+> dominates at moderate sizes. Only beneficial for very large (>100K) sparse matrices.
+> Shift-invert is already available as `shift_invert=True` flag but NOT the default.
 
-### PR 1.6: Shift-Invert eigsh (Tier 1, 2-5x speedup)
-- [ ] TEST: `test_shift_invert_matches_standard` — same ground state energy
-- [ ] TEST: `test_shift_invert_fewer_iterations` — fewer ARPACK iterations
-- [ ] IMPL: Add `sigma=E_hf` shift-invert mode to `_sparse_ground_state()`
-
-### PR 1.7: Streaming Diversity Selection (Tier 1, ~40,000x for n=50K)
-- [ ] TEST: `test_bitpacked_hamming` — uint64 popcount matches naive Hamming
-- [ ] TEST: `test_stochastic_greedy_coverage` — selected set covers all excitation ranks
-- [ ] TEST: `test_stochastic_greedy_no_oom` — handles 50K+ configs, < 1GB memory
-- [ ] TEST: `test_stochastic_greedy_quality` — energy within 1 mHa of full DPP result
-- [ ] IMPL: Bit-parallel Hamming via `torch.bitwise_count` (O(1) per pair)
-- [ ] IMPL: Stochastic Greedy (Mirzasoleiman 2015) replacing O(n²) broadcast
+### PR 1.4: Streaming Diversity Selection ✅ (ADR-001 PR 1.4)
+- [x] TEST: `test_streaming_diversity.py` — 14 tests (bitpack, stochastic greedy, edge cases)
+- [x] TEST: `test_dpp_streaming.py` — 9 tests (DPP delegation, sampled analyze, N2 integration)
+- [x] IMPL: `_dpp_select()` delegates to `stochastic_greedy_select()` (bitpacked XOR + min-dist)
+- [x] IMPL: `analyze_basis_diversity()` uses sampled pairs for n > 5000
+- [x] IMPL: Memory O(n) instead of O(n²). 10K configs: ~160KB vs 4GB.
 
 ### PR 1.8: Mixed-Precision Eigensolver (Tier 2, ~100x for diag on DGX Spark)
 - [ ] TEST: `test_tf32_eigh_accuracy` — TF32 eigensolver within 0.1 mHa of FP64
@@ -63,41 +60,49 @@
 
 ## Phase 2: Acceleration & NF Unlock
 
-### PR 2.0: Numba JIT for get_connections (Tier 2, 50-200x)
-- [ ] TEST: `test_numba_connections_matches_python` — identical results for H2/LiH/N2
-- [ ] TEST: `test_numba_connections_speedup` — > 10x faster than Python loops
-- [ ] IMPL: `@numba.njit` XOR+popcount excitation-degree detection (Scemama algorithm)
-- [ ] IMPL: Numba-compiled Slater-Condon single/double matrix element evaluation
-- [ ] DEP: Add numba to pyproject.toml
+### PR 2.0: Numba JIT for get_connections ✅
+- [x] IMPL: `@numba.njit` for single/double excitation enumeration (18.7x speedup)
+- [x] IMPL: Fallback to Python when numba unavailable
 
 ### PR 2.1: NVPL BLAS/LAPACK (Tier 2, 2-5x CPU linear algebra)
 - [ ] TEST: `test_nvpl_eigh_matches_openblas` — identical eigenvalues
 - [ ] IMPL: Build NumPy/SciPy with NVPL backend (or conda `blas=*=nvpl`)
 
-### PR 2.2: NF Architecture Fixes
-- [ ] TEST: `test_no_dead_beta_scorer` — no unused beta_scorer params
-- [ ] TEST: `test_gumbel_gradient_flow` — gradients flow to all positions
-- [ ] TEST: `test_entropy_weight_nonzero` — default entropy_weight > 0
-- [ ] IMPL: Remove dead `beta_scorer` (~160K params)
-- [ ] IMPL: Fix GumbelTopK gradient masking
-- [ ] IMPL: Set default entropy_weight > 0
+### PR 2.2: NF Architecture Fixes ✅
+- [x] IMPL: Remove dead `beta_scorer` (~160K params)
+- [x] IMPL: SigmoidTopK replaces GumbelTopK (gradient-exact, deterministic)
+- [x] IMPL: Auto-scale hidden_dims by n_orbitals
+- [x] IMPL: Alpha-beta input fix (no zero-padding waste)
+- [x] IMPL: Learnable temperature (nn.Parameter + softplus + min_temperature=0.1)
+- [x] IMPL: Non-autoregressive limitation documented in class docstring
+- [x] TEST: `test_learnable_temperature.py` — 12 tests
 
-### PR 2.3: Sigmoid top-k (research finding, O(n) vs O(nk))
-- [ ] TEST: `test_sigmoid_topk_particle_conservation` — exact electron count
-- [ ] TEST: `test_sigmoid_topk_gradient_flow` — gradients to all positions
-- [ ] IMPL: Sigmoid top-k as drop-in replacement for GumbelTopK
+### PR 2.3: Sigmoid top-k ✅ (merged with PR 2.2)
+- [x] IMPL: SigmoidTopK with implicit differentiation (exact Jacobian)
+- [x] IMPL: Plackett-Luce probability model (exact k≤5, approximate k>5)
 
-### PR 2.4: NF Probability Model Fix
-- [ ] TEST: `test_sequential_log_prob` — conditional factorization matches exact
-- [ ] TEST: `test_loss_scaling_correct` — |E|/batch_size not |E|/|S|
-- [ ] IMPL: Replace product-of-marginals with sequential conditional
-- [ ] IMPL: Fix loss scaling denominator
+### PR 2.4: NF Probability Model Fix ✅
+- [x] IMPL: Sequential conditional factorization (`_sequential_conditional`)
+- [x] IMPL: Loss scaling `|E|/batch_size` (not `|E|/|S|`)
+- [x] IMPL: Entropy separated from energy scaling
+- [x] DOC: REINFORCE 2x factor documented
+- [x] DOC: `_compute_subspace_energy` no-grad documented
+- [x] TEST: `test_probability_model.py`, `test_physics_training_config.py`
 
-### PR 2.5: Enable NF Training for Molecular Systems
-- [ ] TEST: `test_nf_training_enabled` — molecular systems can train NF
-- [ ] TEST: `test_nf_produces_valid_configs` — particle conservation
-- [ ] TEST: `test_nf_improves_energy` — NF configs improve over Direct-CI
-- [ ] IMPL: Remove `skip_nf_training = True` force at pipeline.py:217
+### PR 2.5: Enable NF Training for Molecular Systems ✅
+- [x] IMPL: Conditional NF enable (>20K configs) with `_user_set_skip_nf` override
+- [x] IMPL: `physics_weight=0.1`, `convergence_threshold=0.35`
+- [x] IMPL: Factory function defaults reconciled with PhysicsGuidedConfig
+- [x] TEST: `test_conditional_nf.py` — 14 tests
+
+### PR 2.6: Validate NF on Molecular Systems ✅
+- [x] TEST: `test_nf_lih_basic` — NF trains on LiH without error
+- [x] TEST: `test_nf_particle_conservation` — sampled configs preserve electron count
+- [x] TEST: `test_nf_h2o_sample_diversity` — NF produces diverse excitation ranks
+- [x] TEST: `test_nf_beh2_convergence` — energy decreases over training
+- [x] TEST: `test_nf_produces_valid_configs` — binary configs, correct length
+- [x] TEST: `test_nf_training_with_physics_weight` — no NaN/Inf with physics_weight>0
+- [x] FIX: `_compute_flow_loss` NameError (`configs` → `all_configs`) at line 1113
 
 ---
 

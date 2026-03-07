@@ -172,6 +172,12 @@ class PipelineConfig:
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+    def __post_init__(self):
+        # Track if user explicitly set skip_nf_training (non-default value)
+        # so adapt_to_system_size() won't override their choice.
+        if self.skip_nf_training:
+            self._user_set_skip_nf = True
+
     # === PERFORMANCE OPTIMIZATIONS FOR LARGE SYSTEMS ===
     # These dramatically reduce training time for large molecules (>20 qubits)
 
@@ -212,14 +218,30 @@ class PipelineConfig:
         else:
             tier = "very_large"
 
-        # For molecular systems, skip NF training by default (Direct-CI mode)
-        # Essential configs (HF + singles + doubles) provide a strong initial basis
-        self.skip_nf_training = True
+        # Conditional NF training based on system size (PR 2.1 / ADR-001)
+        # Systems <= 20K configs: Direct-CI sufficient (HF + singles + doubles)
+        # Systems > 20K configs: NF training beneficial for finding important higher excitations
+        # User explicit override (_user_set_skip_nf) is always preserved
+        if not hasattr(self, "_user_set_skip_nf"):
+            if n_valid_configs <= 20000:
+                self.skip_nf_training = True
+            else:
+                self.skip_nf_training = False
 
         if verbose:
             print(f"System size: {n_valid_configs:,} valid configs -> {tier} tier")
             if self.skip_nf_training:
-                print(f"Direct-CI mode: skipping NF-NQS training")
+                if hasattr(self, "_user_set_skip_nf"):
+                    print("Direct-CI mode: user override (skip_nf_training=True)")
+                else:
+                    print(
+                        f"Direct-CI mode: {n_valid_configs:,} configs <= 20K threshold"
+                    )
+            else:
+                print(
+                    f"NF training enabled: {n_valid_configs:,} configs exceeds "
+                    f"Direct-CI threshold (20K)"
+                )
 
         if tier == "small":
             # Small systems: default parameters are fine

@@ -417,6 +417,11 @@ class MolecularIntegrals:
     n_orbitals: int
     n_alpha: int  # Number of alpha electrons
     n_beta: int   # Number of beta electrons
+    # Cache metadata (set by compute_molecular_integrals for FCI caching)
+    _geometry: Optional[list] = None
+    _basis: Optional[str] = None
+    _charge: int = 0
+    _spin: int = 0
 
 
 class MolecularHamiltonian(Hamiltonian):
@@ -1907,7 +1912,7 @@ class MolecularHamiltonian(Hamiltonian):
         # For larger systems, return None for eigenvector
         return fci_energy_val, None
 
-    def fci_energy(self) -> float:
+    def fci_energy(self, use_cache: bool = True) -> float:
         """
         Compute FCI (Full Configuration Interaction) energy.
 
@@ -1918,9 +1923,38 @@ class MolecularHamiltonian(Hamiltonian):
         IMPORTANT: Uses the same matrix_elements() function as the pipeline
         to ensure consistency between FCI reference and pipeline energy.
 
+        Args:
+            use_cache: If True, check/store FCI energy in disk cache.
+
         Returns:
             FCI ground state energy in Hartree
         """
+        # Import cache module once
+        _cache_mod = None
+        _has_cache_meta = (
+            use_cache
+            and hasattr(self.integrals, '_geometry')
+            and self.integrals._geometry is not None
+        )
+        if _has_cache_meta:
+            try:
+                try:
+                    from utils import hamiltonian_cache as _cache_mod
+                except ImportError:
+                    from src.utils import hamiltonian_cache as _cache_mod
+            except Exception:
+                _has_cache_meta = False
+
+        # Try loading from cache
+        if _has_cache_meta:
+            cached_fci = _cache_mod.load_fci_energy(
+                self.integrals._geometry, self.integrals._basis,
+                self.integrals._charge, self.integrals._spin,
+            )
+            if cached_fci is not None:
+                print(f"[HamiltonianCache] Loaded FCI energy from disk cache: {cached_fci:.8f} Ha")
+                return cached_fci
+
         import time
         from itertools import combinations
 
@@ -1977,6 +2011,18 @@ class MolecularHamiltonian(Hamiltonian):
         elapsed = time.time() - start_time
         print(f"FCI energy: {fci_E:.8f} Ha (computed in {elapsed:.1f}s)")
 
+        # Save to cache
+        if _has_cache_meta:
+            try:
+                _cache_mod.save_fci_energy(
+                    self.integrals._geometry, self.integrals._basis,
+                    self.integrals._charge, self.integrals._spin,
+                    fci_E,
+                )
+                print(f"[HamiltonianCache] Saved FCI energy to disk cache")
+            except Exception as e:
+                print(f"[HamiltonianCache] Failed to save FCI energy: {e}")
+
         return fci_E
 
 
@@ -1985,19 +2031,46 @@ def compute_molecular_integrals(
     basis: str = "sto-3g",
     charge: int = 0,
     spin: int = 0,
+    use_cache: bool = True,
 ) -> MolecularIntegrals:
     """
-    Compute molecular integrals using PySCF.
+    Compute molecular integrals using PySCF, with optional disk caching.
 
     Args:
         geometry: List of (atom_symbol, (x, y, z)) tuples
         basis: Basis set name
         charge: Molecular charge
         spin: 2S (number of unpaired electrons)
+        use_cache: If True, check/store disk cache in ~/.cache/molecular-krylov/
 
     Returns:
         MolecularIntegrals object
     """
+    try:
+        from utils.hamiltonian_cache import load_integrals, save_integrals
+    except ImportError:
+        from src.utils.hamiltonian_cache import load_integrals, save_integrals
+
+    # Try loading from cache first
+    if use_cache:
+        cached = load_integrals(geometry, basis, charge, spin)
+        if cached is not None:
+            print(f"[HamiltonianCache] Loaded integrals from disk cache")
+            result = MolecularIntegrals(
+                h1e=cached["h1e"],
+                h2e=cached["h2e"],
+                nuclear_repulsion=cached["nuclear_repulsion"],
+                n_electrons=cached["n_electrons"],
+                n_orbitals=cached["n_orbitals"],
+                n_alpha=cached["n_alpha"],
+                n_beta=cached["n_beta"],
+            )
+            result._geometry = list(geometry)
+            result._basis = basis
+            result._charge = charge
+            result._spin = spin
+            return result
+
     try:
         from pyscf import gto, scf, ao2mo
     except ImportError:
@@ -2009,6 +2082,10 @@ def compute_molecular_integrals(
     mol.basis = basis
     mol.charge = charge
     mol.spin = spin
+    # Enable symmetry to resolve degenerate orbital rotations (e.g., N2 pi orbitals).
+    # PySCF uses Abelian subgroups (D2h etc.) which split degenerate irreps,
+    # making MO coefficients deterministic across SCF runs.
+    mol.symmetry = True
     mol.build()
 
     # Run HF to get orbitals
@@ -2030,15 +2107,34 @@ def compute_molecular_integrals(
     n_alpha = (n_electrons + spin) // 2
     n_beta = (n_electrons - spin) // 2
 
-    return MolecularIntegrals(
+    nuclear_repulsion = mol.energy_nuc()
+
+    # Save to cache
+    if use_cache:
+        try:
+            mol_hash = save_integrals(
+                geometry, basis, charge, spin,
+                h1e, h2e, nuclear_repulsion,
+                n_electrons, n_orbitals, n_alpha, n_beta,
+            )
+            print(f"[HamiltonianCache] Saved integrals to disk cache ({mol_hash})")
+        except Exception as e:
+            print(f"[HamiltonianCache] Failed to save integrals: {e}")
+
+    result = MolecularIntegrals(
         h1e=h1e,
         h2e=h2e,
-        nuclear_repulsion=mol.energy_nuc(),
+        nuclear_repulsion=nuclear_repulsion,
         n_electrons=n_electrons,
         n_orbitals=n_orbitals,
         n_alpha=n_alpha,
         n_beta=n_beta,
     )
+    result._geometry = list(geometry)
+    result._basis = basis
+    result._charge = charge
+    result._spin = spin
+    return result
 
 
 def create_h2_hamiltonian(

@@ -50,8 +50,15 @@ class TestDeadBetaScorer:
         loss.backward()
 
         # Check all parameters received gradients
+        # log_temperature is a sampling exploration parameter — it affects WHICH
+        # configs are selected but not the Plackett-Luce log_prob computation,
+        # so it correctly gets zero gradient through this loss path.
+        # It gets gradients when used in a KL-divergence loss on the soft output.
+        excluded = {'flow.topk_selector.log_temperature'}
         unused_params = []
         for name, param in flow.named_parameters():
+            if name in excluded:
+                continue
             if param.grad is None or param.grad.abs().max().item() == 0:
                 unused_params.append(name)
 

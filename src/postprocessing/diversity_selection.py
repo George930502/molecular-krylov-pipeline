@@ -506,11 +506,11 @@ class DiversitySelector:
         n_select: int,
     ) -> torch.Tensor:
         """
-        DPP-inspired selection for diversity.
+        DPP-inspired diversity selection using streaming greedy.
 
-        Uses greedy approximation to DPP:
-        1. Start with highest-weight config
-        2. Iteratively add config that maximizes weight * min_distance
+        Delegates to stochastic_greedy_select() which uses bitpacked
+        Hamming + incremental min-distance tracking. Memory O(n) instead
+        of O(n²). Time O(n·log(1/ε)) instead of O(n·k).
         """
         n = len(configs)
         device = configs.device
@@ -518,48 +518,12 @@ class DiversitySelector:
         if n <= n_select:
             return torch.arange(n, device=device)
 
-        # Compute distance matrix
-        distances = compute_hamming_distance_matrix(configs).float()
-
-        # Greedy selection
-        selected = []
-        remaining = set(range(n))
-
-        # Start with highest weight
-        first = weights.argmax().item()
-        selected.append(first)
-        remaining.remove(first)
-
-        while len(selected) < n_select and remaining:
-            best_score = -float('inf')
-            best_idx = None
-
-            for idx in remaining:
-                # Minimum distance to already selected
-                min_dist = distances[idx, selected].min().item()
-
-                # Skip if too close
-                if min_dist < self.config.min_hamming_distance:
-                    continue
-
-                # Score = weight * distance^scale
-                score = weights[idx].item() * (min_dist ** self.config.dpp_kernel_scale)
-
-                if score > best_score:
-                    best_score = score
-                    best_idx = idx
-
-            if best_idx is None:
-                # All remaining are too close, pick by weight
-                remaining_list = list(remaining)
-                remaining_weights = weights[remaining_list]
-                best_local = remaining_weights.argmax().item()
-                best_idx = remaining_list[best_local]
-
-            selected.append(best_idx)
-            remaining.remove(best_idx)
-
-        return torch.tensor(selected, device=device)
+        return stochastic_greedy_select(
+            configs,
+            weights,
+            n_select,
+            min_hamming=self.config.min_hamming_distance,
+        )
 
 
 def select_diverse_basis(
@@ -615,11 +579,26 @@ def analyze_basis_diversity(
         rank_counts[f'rank_{r}'] = ranks.count(r)
 
     # Distance statistics
+    # For large bases, use sampled pairs to avoid O(n²) memory
+    SAMPLED_DISTANCE_THRESHOLD = 5000
     if n > 1:
-        distances = compute_hamming_distance_matrix(configs)
-        # Get upper triangle (excluding diagonal)
-        triu_indices = torch.triu_indices(n, n, offset=1, device=device)
-        pairwise_dists = distances[triu_indices[0], triu_indices[1]]
+        if n <= SAMPLED_DISTANCE_THRESHOLD:
+            distances = compute_hamming_distance_matrix(configs)
+            triu_indices = torch.triu_indices(n, n, offset=1, device=device)
+            pairwise_dists = distances[triu_indices[0], triu_indices[1]]
+        else:
+            # Sample random pairs for distance statistics
+            n_samples = min(50000, n * (n - 1) // 2)
+            packed = bitpack_configs(configs)
+            gen = torch.Generator(device='cpu')
+            gen.manual_seed(42)
+            idx_a = torch.randint(0, n, (n_samples,), generator=gen)
+            idx_b = torch.randint(0, n, (n_samples,), generator=gen)
+            # Re-draw pairs where idx_a == idx_b
+            same = idx_a == idx_b
+            idx_b[same] = (idx_b[same] + 1) % n
+            xor = packed[idx_a] ^ packed[idx_b]
+            pairwise_dists = _popcount_int64(xor)
 
         dist_stats = {
             'mean_distance': pairwise_dists.float().mean().item(),

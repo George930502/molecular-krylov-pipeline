@@ -31,8 +31,9 @@ from hamiltonians.molecular import MolecularHamiltonian
 # Chemical accuracy in Hartree
 CHEMICAL_ACCURACY_HA = 1.594e-3
 
-# Regression bounds (mHa) — 10x the RESULTS.md values as safety margin,
-# with a floor of 0.1 mHa for numerically exact results.
+# Regression bounds (mHa) — safety margin above typical observed errors.
+# N2 has large MO-dependent numerical variance due to degenerate pi orbitals;
+# our matrix_elements() vs PySCF FCI can differ by up to ~10 mHa depending on MO choice.
 REGRESSION_BOUNDS_MHA = {
     "h2": 0.1,
     "lih": 0.2,
@@ -40,7 +41,7 @@ REGRESSION_BOUNDS_MHA = {
     "beh2": 0.5,
     "nh3": 2.0,
     "ch4": 4.0,
-    "n2": 1.0,
+    "n2": 1.0,  # Symmetry-adapted SCF resolves N2 pi orbital degeneracy
 }
 
 

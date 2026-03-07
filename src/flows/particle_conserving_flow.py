@@ -16,6 +16,8 @@ References:
 - Plackett-Luce: probability model for without-replacement subset selection
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -141,9 +143,28 @@ class SigmoidTopK(nn.Module):
     Reference: Thomas Ahle, "A Differentiable Top-k Layer for PyTorch" (2022)
     """
 
-    def __init__(self, temperature: float = 1.0):
+    def __init__(self, temperature: float = 1.0, min_temperature: float = 0.1):
         super().__init__()
-        self.temperature = temperature
+        self.min_temperature = min_temperature
+        # Store temperature in log-space as nn.Parameter so the optimizer can learn it.
+        # Actual temperature = min_temperature + softplus(log_temperature), ensuring > min.
+        self.log_temperature = nn.Parameter(
+            torch.tensor(math.log(math.expm1(max(temperature - min_temperature, 1e-6))))
+        )
+
+    @property
+    def temperature(self):
+        """Effective temperature: min_temperature + softplus(log_temperature)."""
+        return self.min_temperature + F.softplus(self.log_temperature)
+
+    @temperature.setter
+    def temperature(self, value):
+        """Allow external temperature setting (e.g., annealing schedule)."""
+        with torch.no_grad():
+            # Invert: value = min_temp + softplus(log_temp)
+            # softplus(x) = log(1 + exp(x)), inverse: x = log(exp(target) - 1)
+            target = max(value - self.min_temperature, 1e-6)
+            self.log_temperature.copy_(torch.tensor(math.log(math.expm1(target))))
 
     def forward(
         self,
@@ -255,21 +276,26 @@ class ParticleConservingFlow(nn.Module):
     - Uses separate networks for alpha and beta spin channels
     - Beta channel is conditioned on alpha configuration (sees which orbitals
       alpha occupies for Pauli exclusion and spatial correlation modeling)
-    - Differentiable via Gumbel-top-k (or SigmoidTopK when available)
+    - Differentiable via SigmoidTopK with learnable temperature (nn.Parameter)
+    - Temperature is clamped above min_temperature via softplus reparameterization
 
     The output is a (batch_size, 2*n_orbitals) tensor where:
     - First n_orbitals: alpha spin occupations (0 or 1)
     - Last n_orbitals: beta spin occupations (0 or 1)
 
-    Architecture limitation (non-autoregressive):
-    Both alpha and beta channels predict all orbital logits simultaneously
-    via a single MLP pass, then select top-k. This means the model cannot
-    capture intra-channel orbital correlations (e.g., "if orbital 3 is
-    occupied, orbital 5 should also be occupied"). For weakly correlated
-    systems (N2 at equilibrium) this suffices, but for strongly correlated
-    systems (Cr2, [2Fe-2S]) an autoregressive architecture (e.g., MADE,
-    transformer decoder per Barrett 2022 / QiankunNet 2025) would be needed.
-    Planned for Phase 4 of the 40Q scale-up (ADR-001).
+    Architecture limitation (non-autoregressive / product-of-marginals):
+    - Alpha channel: all orbital logits are predicted simultaneously from a
+      single learnable parameter vector (no context). The joint probability
+      factorizes as P(alpha) = Product_i P(o_i), a product of independent
+      marginals. There are no inter-orbital correlations within alpha.
+    - Beta channel: conditioned on the sampled alpha configuration via an
+      MLP, so beta "sees" which alpha orbitals are occupied. However, within
+      the beta channel itself, all orbital logits are again predicted in one
+      MLP pass — no sequential/autoregressive dependence between beta orbitals.
+    - For weakly correlated systems (H2, LiH, N2 at equilibrium on STO-3G)
+      this product-of-marginals approximation suffices. For strongly correlated
+      systems (Cr2, [2Fe-2S], stretched bonds) an autoregressive architecture
+      is needed. Planned for Phase 4 of the 40Q scale-up (ADR-001).
     """
 
     def __init__(
@@ -321,11 +347,18 @@ class ParticleConservingFlow(nn.Module):
         # SigmoidTopK: deterministic, gradient-exact top-k via implicit differentiation.
         # Replaces GumbelTopK which has vanishing gradients at non-selected positions.
         self.topk_selector = SigmoidTopK(temperature)
-        self.temperature = temperature
+
+    @property
+    def temperature(self):
+        """Delegate to topk_selector's learnable temperature."""
+        return self.topk_selector.temperature
+
+    @temperature.setter
+    def temperature(self, value):
+        self.topk_selector.temperature = value
 
     def set_temperature(self, temperature: float):
-        """Update temperature for Gumbel sampling."""
-        self.temperature = temperature
+        """Update temperature for top-k sampling."""
         self.topk_selector.temperature = temperature
 
     def sample(
