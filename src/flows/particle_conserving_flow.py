@@ -67,15 +67,17 @@ class GumbelTopK(nn.Module):
         one_hot = torch.zeros_like(logits)
         one_hot.scatter_(1, top_indices, 1.0)
 
+        # Soft relaxation: full softmax over all positions (preserves gradients everywhere)
+        soft = F.softmax(perturbed_logits, dim=-1)
+
         if hard:
-            # Straight-through estimator: hard in forward, soft gradient in backward
-            soft = F.softmax(perturbed_logits, dim=-1)
-            # Create soft version by summing top-k softmax values
-            soft_topk = soft * one_hot
-            return one_hot - soft_topk.detach() + soft_topk
+            # Straight-through estimator: hard selection in forward, soft gradients in backward.
+            # Use full softmax (not masked) so gradients flow to ALL positions, enabling
+            # the network to learn to increase/decrease any orbital's probability.
+            return one_hot - soft.detach() + soft
         else:
             # Fully soft (for exploration/temperature annealing)
-            return F.softmax(perturbed_logits / self.temperature, dim=-1)
+            return soft
 
 
 class OrbitalScoringNetwork(nn.Module):
@@ -179,13 +181,10 @@ class ParticleConservingFlow(nn.Module):
         self.n_beta = n_beta
         self.n_qubits = 2 * n_orbitals
 
-        # Separate scoring networks for alpha and beta spins
-        self.alpha_scorer = OrbitalScoringNetwork(
-            n_orbitals, hidden_dims
-        )
-        self.beta_scorer = OrbitalScoringNetwork(
-            n_orbitals, hidden_dims
-        )
+        # Alpha spin scoring: learnable logits (no context available for alpha)
+        # Using a simple parameter instead of OrbitalScoringNetwork avoids dead weights,
+        # since alpha is always sampled first without context.
+        self.alpha_logits = nn.Parameter(torch.zeros(n_orbitals))
 
         # Alpha-beta correlation network
         # Beta scorer can see alpha configuration for correlation
@@ -229,8 +228,8 @@ class ParticleConservingFlow(nn.Module):
         """
         device = next(self.parameters()).device
 
-        # Sample alpha spin channel
-        alpha_logits = self.alpha_scorer(context=None, batch_size=batch_size)
+        # Sample alpha spin channel (learnable logits, no context)
+        alpha_logits = self.alpha_logits.unsqueeze(0).expand(batch_size, -1)
         alpha_config = self.gumbel_topk(alpha_logits, self.n_alpha, hard=hard)
 
         # Sample beta spin channel conditioned on alpha
