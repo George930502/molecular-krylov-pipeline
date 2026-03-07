@@ -2101,10 +2101,17 @@ def compute_molecular_integrals(
 
     # CAS active space path
     if cas is not None:
-        from pyscf import mcscf
+        from pyscf import mcscf, fci
 
         nelecas, ncas = cas
         mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
+
+        # Linear molecules (D∞h/C∞v) with symmetry=True can cause
+        # PointGroupSymmetryError when CAS orbital selection breaks
+        # an E-irrep pair. Use the non-symmetry FCI solver to avoid this.
+        if mol.symmetry and mol.topgroup in ('Dooh', 'Coov'):
+            mc.fcisolver = fci.direct_spin1.FCISolver(mol)
+
         mc.kernel()
 
         if not mc.converged:
