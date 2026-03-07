@@ -241,17 +241,36 @@ class SQDSolver:
             # Create K batches
             batches = self._create_batches(all_configs, batch_size, cfg.num_batches)
 
-            # Diagonalize each batch (parallel when max_workers > 1)
-            if cfg.max_workers > 1 and len(batches) > 1:
+            # Diagonalize each batch (parallel when beneficial)
+            # Adaptive: only parallelize when per-batch work justifies thread overhead.
+            # Small identical batches (n <= batch_size) hit H cache after the first build,
+            # making sequential faster. ThreadPoolExecutor + GIL also limits CPU-bound gains.
+            batches_are_distinct = (n_available > batch_size)
+            use_parallel = (
+                cfg.max_workers > 1
+                and len(batches) > 1
+                and batch_size > 3000
+                and batches_are_distinct
+            )
+
+            if use_parallel:
                 from concurrent.futures import ThreadPoolExecutor
-                import os
-                # Prevent BLAS thread oversubscription: each worker uses 1 BLAS thread
-                old_omp = os.environ.get('OMP_NUM_THREADS')
-                old_openblas = os.environ.get('OPENBLAS_NUM_THREADS')
-                os.environ['OMP_NUM_THREADS'] = '1'
-                os.environ['OPENBLAS_NUM_THREADS'] = '1'
                 try:
-                    n_workers = min(cfg.max_workers, len(batches))
+                    from threadpoolctl import threadpool_limits
+                    _has_threadpoolctl = True
+                except ImportError:
+                    _has_threadpoolctl = False
+
+                n_workers = min(cfg.max_workers, len(batches))
+                # Limit BLAS threads per worker to prevent oversubscription
+                import os
+                blas_threads = max(1, (os.cpu_count() or 4) // n_workers)
+
+                if _has_threadpoolctl:
+                    ctx = threadpool_limits(limits=blas_threads, user_api='blas')
+                    ctx.__enter__()
+
+                try:
                     with ThreadPoolExecutor(max_workers=n_workers) as pool:
                         futures = {
                             pool.submit(self._diagonalize_batch, batch, k): k
@@ -262,15 +281,9 @@ class SQDSolver:
                             k = futures[future]
                             batch_results[k] = future.result()
                 finally:
-                    # Restore BLAS thread settings
-                    if old_omp is not None:
-                        os.environ['OMP_NUM_THREADS'] = old_omp
-                    else:
-                        os.environ.pop('OMP_NUM_THREADS', None)
-                    if old_openblas is not None:
-                        os.environ['OPENBLAS_NUM_THREADS'] = old_openblas
-                    else:
-                        os.environ.pop('OPENBLAS_NUM_THREADS', None)
+                    if _has_threadpoolctl:
+                        ctx.__exit__(None, None, None)
+
                 if progress:
                     for k, result in enumerate(batch_results):
                         print(f"    Batch {k+1}: E = {result['energy']:.8f} Ha "

@@ -253,11 +253,23 @@ class ParticleConservingFlow(nn.Module):
     - Always generates configurations with exactly n_alpha alpha electrons
     - Always generates configurations with exactly n_beta beta electrons
     - Uses separate networks for alpha and beta spin channels
-    - Differentiable via Gumbel-top-k
+    - Beta channel is conditioned on alpha configuration (sees which orbitals
+      alpha occupies for Pauli exclusion and spatial correlation modeling)
+    - Differentiable via Gumbel-top-k (or SigmoidTopK when available)
 
     The output is a (batch_size, 2*n_orbitals) tensor where:
     - First n_orbitals: alpha spin occupations (0 or 1)
     - Last n_orbitals: beta spin occupations (0 or 1)
+
+    Architecture limitation (non-autoregressive):
+    Both alpha and beta channels predict all orbital logits simultaneously
+    via a single MLP pass, then select top-k. This means the model cannot
+    capture intra-channel orbital correlations (e.g., "if orbital 3 is
+    occupied, orbital 5 should also be occupied"). For weakly correlated
+    systems (N2 at equilibrium) this suffices, but for strongly correlated
+    systems (Cr2, [2Fe-2S]) an autoregressive architecture (e.g., MADE,
+    transformer decoder per Barrett 2022 / QiankunNet 2025) would be needed.
+    Planned for Phase 4 of the 40Q scale-up (ADR-001).
     """
 
     def __init__(
@@ -265,7 +277,7 @@ class ParticleConservingFlow(nn.Module):
         n_orbitals: int,
         n_alpha: int,
         n_beta: int,
-        hidden_dims: list = [256, 256],
+        hidden_dims: list = None,
         temperature: float = 1.0,
     ):
         super().__init__()
@@ -274,34 +286,47 @@ class ParticleConservingFlow(nn.Module):
         self.n_beta = n_beta
         self.n_qubits = 2 * n_orbitals
 
+        # Auto-scale hidden dims by system size (depth > width, per FermiNet/Psiformer)
+        if hidden_dims is None:
+            if n_orbitals <= 10:
+                hidden_dims = [256, 256]
+            elif n_orbitals <= 15:
+                hidden_dims = [256, 256, 256]
+            else:  # 16+ orbitals (32+ qubits)
+                hidden_dims = [384, 384, 256]
+
         # Alpha spin scoring: learnable logits (no context available for alpha)
         # Using a simple parameter instead of OrbitalScoringNetwork avoids dead weights,
         # since alpha is always sampled first without context.
         self.alpha_logits = nn.Parameter(torch.zeros(n_orbitals))
 
         # Alpha-beta correlation network
-        # Beta scorer can see alpha configuration for correlation
+        # Beta scorer receives alpha_config directly (not zeros) for orbital
+        # conflict modeling (Pauli exclusion, spatial correlation)
         self.alpha_to_beta = nn.Sequential(
             nn.Linear(n_orbitals, 128),
             nn.SiLU(),
             nn.Linear(128, 64),
         )
-        self.beta_conditioned_scorer = nn.Sequential(
-            nn.Linear(n_orbitals + 64, hidden_dims[0]),
-            nn.SiLU(),
-            nn.Linear(hidden_dims[0], hidden_dims[-1]),
-            nn.SiLU(),
-            nn.Linear(hidden_dims[-1], n_orbitals),
-        )
+        # Build beta scorer with variable depth
+        beta_layers = []
+        in_dim = n_orbitals + 64  # alpha_config + alpha_context
+        for h_dim in hidden_dims:
+            beta_layers.append(nn.Linear(in_dim, h_dim))
+            beta_layers.append(nn.SiLU())
+            in_dim = h_dim
+        beta_layers.append(nn.Linear(in_dim, n_orbitals))
+        self.beta_conditioned_scorer = nn.Sequential(*beta_layers)
 
-        # Gumbel-top-k selector
-        self.gumbel_topk = GumbelTopK(temperature)
+        # SigmoidTopK: deterministic, gradient-exact top-k via implicit differentiation.
+        # Replaces GumbelTopK which has vanishing gradients at non-selected positions.
+        self.topk_selector = SigmoidTopK(temperature)
         self.temperature = temperature
 
     def set_temperature(self, temperature: float):
         """Update temperature for Gumbel sampling."""
         self.temperature = temperature
-        self.gumbel_topk.temperature = temperature
+        self.topk_selector.temperature = temperature
 
     def sample(
         self,
@@ -323,16 +348,16 @@ class ParticleConservingFlow(nn.Module):
 
         # Sample alpha spin channel (learnable logits, no context)
         alpha_logits = self.alpha_logits.unsqueeze(0).expand(batch_size, -1)
-        alpha_config = self.gumbel_topk(alpha_logits, self.n_alpha, hard=hard)
+        alpha_config = self.topk_selector(alpha_logits, self.n_alpha, hard=hard)
 
         # Sample beta spin channel conditioned on alpha
         alpha_context = self.alpha_to_beta(alpha_config)
         beta_input = torch.cat([
-            torch.zeros(batch_size, self.n_orbitals, device=device),
+            alpha_config.float(),
             alpha_context
         ], dim=-1)
         beta_logits = self.beta_conditioned_scorer(beta_input)
-        beta_config = self.gumbel_topk(beta_logits, self.n_beta, hard=hard)
+        beta_config = self.topk_selector(beta_logits, self.n_beta, hard=hard)
 
         # Combine into full configuration
         configs = torch.cat([alpha_config, beta_config], dim=-1)
@@ -467,7 +492,7 @@ class ParticleConservingFlow(nn.Module):
         # Beta logits (conditioned on alpha)
         alpha_context = self.alpha_to_beta(alpha_config.float())
         beta_input = torch.cat([
-            torch.zeros(batch_size, self.n_orbitals, device=device),
+            alpha_config.float(),
             alpha_context
         ], dim=-1)
         beta_logits = self.beta_conditioned_scorer(beta_input)
@@ -546,9 +571,6 @@ class ParticleConservingFlowSampler(nn.Module):
         self.num_sites = num_sites
         self.n_alpha = n_alpha
         self.n_beta = n_beta
-
-        if hidden_dims is None:
-            hidden_dims = [256, 256]
 
         self.flow = ParticleConservingFlow(
             n_orbitals=self.n_orbitals,
