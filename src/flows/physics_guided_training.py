@@ -37,6 +37,15 @@ try:
 except ImportError:
     from utils.connection_cache import ConnectionCache
 
+# AutoregressiveFlowSampler import — optional, graceful fallback to None sentinel
+try:
+    from .autoregressive_flow import AutoregressiveFlowSampler as _AutoregressiveFlowSampler
+except ImportError:
+    try:
+        from flows.autoregressive_flow import AutoregressiveFlowSampler as _AutoregressiveFlowSampler
+    except ImportError:
+        _AutoregressiveFlowSampler = None  # type: ignore[assignment,misc]
+
 
 @dataclass
 class PhysicsGuidedConfig:
@@ -1091,8 +1100,22 @@ class PhysicsGuidedFlowTrainer:
         # The old path: estimate_discrete_prob → log(exp(lp) + eps) would underflow
         # for log_prob < -87 (float32), returning -23.03 instead of the true value.
         log_flow_probs_raw = self.flow.log_prob(unique_configs)
-        log_Z = torch.logsumexp(log_flow_probs_raw, dim=0)
-        log_flow_probs = log_flow_probs_raw - log_Z
+
+        # AutoregressiveFlowSampler log_prob() returns exact, fully-normalized log
+        # probabilities (sum over ALL valid configs = 1.0, proven by the autoregressive
+        # factorization).  Re-normalizing over only the current batch would inflate every
+        # config's probability by log(1 / sum_batch), introducing a systematic bias.
+        # For ParticleConservingFlowSampler the batch re-normalization is kept as a
+        # safety measure (its Plackett-Luce probabilities are normalized but the
+        # logsumexp guard has historically masked any numerical drift).
+        _is_ar_flow = _AutoregressiveFlowSampler is not None and isinstance(
+            self.flow, _AutoregressiveFlowSampler
+        )
+        if _is_ar_flow:
+            log_flow_probs = log_flow_probs_raw
+        else:
+            log_Z = torch.logsumexp(log_flow_probs_raw, dim=0)
+            log_flow_probs = log_flow_probs_raw - log_Z
         flow_probs = torch.exp(log_flow_probs)
 
         # === Teacher Loss ===

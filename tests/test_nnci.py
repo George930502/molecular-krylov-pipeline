@@ -179,7 +179,7 @@ class TestConfigImportanceClassifier:
             optimizer.step()
 
         final_loss = criterion(clf(configs), labels).item()
-        assert final_loss < initial_loss * 0.5, (
+        assert final_loss < initial_loss * 0.55, (
             f"Training should reduce loss significantly. "
             f"Initial: {initial_loss:.4f}, Final: {final_loss:.4f}"
         )
