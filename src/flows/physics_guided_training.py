@@ -1055,6 +1055,8 @@ class PhysicsGuidedFlowTrainer:
         # NOTE: Do NOT multiply by n_total - that was a bug causing ~300,000x energy inflation!
         sampled_probs = probs[indices]
         reweight_factor = 1.0 / (n_sample * sampled_probs + 1e-10)
+        # Clip to prevent weight explosion when sampled_probs << 1
+        reweight_factor = torch.clamp(reweight_factor, max=100.0)
         reweighted_elements = all_elements[indices] * reweight_factor
 
         return (

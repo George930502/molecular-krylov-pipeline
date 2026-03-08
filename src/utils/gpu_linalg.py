@@ -293,6 +293,13 @@ def sparse_hamiltonian_eigsh(
 
     k_eig = min(k, n - 1)
 
+    # Single-config basis: eigsh requires k >= 1 but n-1 = 0.
+    # The answer is trivially the diagonal element.
+    if k_eig < 1:
+        eigenvalues = torch.tensor([diag_np[0]], dtype=torch.float64)
+        eigenvectors = torch.eye(n, 1, dtype=torch.float64)
+        return eigenvalues.to(device), eigenvectors.to(device)
+
     if shift_invert:
         sigma = float(hamiltonian.diagonal_element(
             hamiltonian.get_hf_state()
