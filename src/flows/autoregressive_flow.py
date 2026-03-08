@@ -578,7 +578,10 @@ class AutoregressiveFlowSampler(nn.Module):
         self.num_sites = num_sites
         self.n_alpha = n_alpha
         self.n_beta = n_beta
-        self.temperature = temperature
+
+        # Store temperature as a registered buffer so it survives state_dict save/load
+        # and .to(device) calls.  Not a nn.Parameter — we don't backprop through it.
+        self.register_buffer("_temperature", torch.tensor(temperature, dtype=torch.float32))
 
         # Auto-scale transformer config if not provided
         if transformer_config is None:
@@ -628,7 +631,7 @@ class AutoregressiveFlowSampler(nn.Module):
                 n_heads=8,
                 d_model=256,
                 d_ff=1024,
-                dropout=0.0,
+                dropout=0.1,
             )
         else:
             return AutoregressiveConfig(
@@ -636,7 +639,7 @@ class AutoregressiveFlowSampler(nn.Module):
                 n_heads=8,
                 d_model=256,
                 d_ff=1024,
-                dropout=0.0,
+                dropout=0.1,
             )
 
     # ------------------------------------------------------------------
@@ -702,7 +705,7 @@ class AutoregressiveFlowSampler(nn.Module):
                 logits_i = logits_step[:, -1, :]  # (batch, 4)
 
             # Apply temperature
-            logits_i = logits_i / self.temperature
+            logits_i = logits_i / self._temperature
 
             # Compute validity mask
             orbitals_after = n_orb - i - 1
@@ -758,7 +761,7 @@ class AutoregressiveFlowSampler(nn.Module):
         logits = self.transformer(input_seq)  # (batch, n_orb, 4)
 
         # Apply temperature
-        logits = logits / self.temperature
+        logits = logits / self._temperature
 
         # Vectorized validity masking: precompute electron budgets at all positions
         # via cumulative sums (eliminates Python loop for GPU parallelism).
@@ -887,6 +890,11 @@ class AutoregressiveFlowSampler(nn.Module):
         """
         return torch.exp(self.log_prob(configs))
 
+    @property
+    def temperature(self) -> float:
+        """Current sampling temperature."""
+        return self._temperature.item()
+
     def set_temperature(self, temperature: float):
         """Set the sampling temperature.
 
@@ -897,7 +905,7 @@ class AutoregressiveFlowSampler(nn.Module):
         """
         if temperature <= 0:
             raise ValueError(f"Temperature must be positive, got {temperature}")
-        self.temperature = temperature
+        self._temperature.fill_(temperature)
 
     def forward(self, n_samples: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass (same as ``sample()``).

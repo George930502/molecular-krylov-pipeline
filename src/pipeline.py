@@ -464,11 +464,15 @@ class FlowGuidedKrylovPipeline:
         """Initialize flow, NQS, and auxiliary components."""
         cfg = self.config
 
-        # Initialize flow sampler for molecules
+        # Initialize flow sampler for molecules — skip if Direct-CI mode
+        # (avoid allocating GPU memory for a model that won't be used)
         n_alpha = self.hamiltonian.n_alpha
         n_beta = self.hamiltonian.n_beta
 
-        if cfg.use_autoregressive_flow:
+        if cfg.skip_nf_training and not cfg.use_vmc_training:
+            self.flow = None
+            print("Direct-CI mode: flow sampler not initialized (saves GPU memory)")
+        elif cfg.use_autoregressive_flow:
             self.flow = AutoregressiveFlowSampler(
                 num_sites=self.num_sites,
                 n_alpha=n_alpha,
