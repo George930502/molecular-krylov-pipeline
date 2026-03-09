@@ -49,7 +49,7 @@ def gpu_eigh(
 
     # Use float64 for numerical precision
     if dtype not in (torch.float64, torch.complex128):
-        H = H.double()
+        H = H.to(torch.complex128) if H.is_complex() else H.double()
 
     # Ensure Hermitian (symmetrize for numerical stability)
     if H.is_complex():
@@ -137,6 +137,186 @@ def gpu_eigsh(
         raise ValueError(f"Unknown which={which}")
 
 
+def mixed_precision_eigh(
+    H: torch.Tensor,
+    use_gpu: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Mixed-precision eigendecomposition: FP32 solve + FP64 Rayleigh quotient refinement.
+
+    DGX Spark GB10 has FP64=0.48 TFLOPS but TF32=53 TFLOPS (110x ratio).
+    Strategy:
+      1. Solve eigh in FP32 (uses TF32 matmul on GPU, ~100x faster)
+      2. Refine eigenvalues via FP64 Rayleigh quotient: E_i = v_i^T H_64 v_i / (v_i^T v_i)
+      3. Return FP64-refined eigenvalues with FP64-upcast eigenvectors
+
+    For small matrices or already-FP64 input, falls back to standard FP64 eigh
+    since FP32 rounding offers no speedup benefit.
+
+    Args:
+        H: Hermitian matrix (n, n) — real or complex, any dtype
+        use_gpu: If True, keep computation on GPU
+
+    Returns:
+        eigenvalues: (n,) tensor of FP64-refined eigenvalues in ascending order
+        eigenvectors: (n, n) tensor of eigenvectors (FP64)
+    """
+    device = H.device
+
+    # Move to correct device
+    if use_gpu and torch.cuda.is_available() and not H.is_cuda:
+        H = H.cuda()
+    elif not use_gpu and H.is_cuda:
+        H = H.cpu()
+
+    n = H.shape[0]
+
+    # For very small matrices (n <= 64), FP32 rounding noise is negligible
+    # and the overhead of two solves isn't worth it. Use FP64 directly.
+    if n <= 64:
+        return gpu_eigh(H, use_gpu=use_gpu)
+
+    # For already-FP64/complex128 input, the whole point of mixed-precision is
+    # to avoid full FP64 eigh. But if the caller explicitly provides FP64, honor it.
+    # Only apply mixed-precision when input is FP32 or lower precision.
+    if H.dtype in (torch.float64, torch.complex128):
+        return gpu_eigh(H, use_gpu=use_gpu)
+
+    # Determine FP32/FP64 dtype pairs based on real vs complex input
+    is_complex = H.is_complex()
+    if is_complex:
+        low_dtype = torch.complex64
+        high_dtype = torch.complex128
+    else:
+        low_dtype = torch.float32
+        high_dtype = torch.float64
+
+    # Keep FP64 copy for Rayleigh refinement
+    H_fp64 = H.to(high_dtype)
+
+    # Symmetrize for numerical stability
+    if is_complex:
+        H_fp64 = 0.5 * (H_fp64 + H_fp64.conj().T)
+    else:
+        H_fp64 = 0.5 * (H_fp64 + H_fp64.T)
+
+    # Step 1: Solve in FP32 (leverages TF32 matmul on Ampere+ GPUs)
+    H_fp32 = H_fp64.to(low_dtype)
+    try:
+        evals_fp32, evecs_fp32 = torch.linalg.eigh(H_fp32)
+    except Exception:
+        # FP32 eigh failed (e.g., severe ill-conditioning) — fall back to FP64
+        evals_fp64, evecs_fp64 = torch.linalg.eigh(H_fp64)
+        return evals_fp64, evecs_fp64
+
+    # Step 2: Upcast eigenvectors to FP64
+    evecs_fp64 = evecs_fp32.to(high_dtype)
+
+    # Step 3: FP64 Rayleigh quotient refinement
+    # E_i = v_i^T H_64 v_i / (v_i^T v_i)
+    # This recovers FP64 accuracy from FP32 eigenvectors because the
+    # Rayleigh quotient is stationary at exact eigenvectors, so first-order
+    # errors in v cancel out, giving second-order accurate energies.
+    Hv = H_fp64 @ evecs_fp64  # (n, n) @ (n, n) = (n, n)
+
+    # Compute Rayleigh quotient for each eigenvector
+    if is_complex:
+        # For complex: E_i = Re(v_i^H @ H @ v_i) / (v_i^H @ v_i)
+        numerator = (evecs_fp64.conj() * Hv).sum(dim=0).real
+        denominator = (evecs_fp64.conj() * evecs_fp64).sum(dim=0).real
+    else:
+        numerator = (evecs_fp64 * Hv).sum(dim=0)
+        denominator = (evecs_fp64 * evecs_fp64).sum(dim=0)
+
+    evals_refined = numerator / denominator
+
+    # Sort by eigenvalue (FP32 ordering should be correct, but refine may shift)
+    sort_idx = evals_refined.argsort()
+    evals_refined = evals_refined[sort_idx]
+    evecs_fp64 = evecs_fp64[:, sort_idx]
+
+    return evals_refined, evecs_fp64
+
+
+def sparse_hamiltonian_eigsh(
+    hamiltonian,
+    basis: torch.Tensor,
+    k: int = 2,
+    which: str = 'SA',
+    shift_invert: bool = False,
+    tol: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build projected Hamiltonian in sparse CSR format and solve with eigsh.
+
+    Never materializes the full dense matrix. Memory: O(n * avg_nnz_per_row)
+    instead of O(n^2).
+
+    For molecular Hamiltonians with Slater-Condon rules, nnz/row varies:
+    HF row ~7.8K, singles ~250, doubles ~36-50. Weighted avg ~54-128 for
+    essential-only basis. Matrix is 0.1-6% dense — highly efficient for eigsh.
+
+    Args:
+        hamiltonian: MolecularHamiltonian with get_sparse_matrix_elements()
+                     and diagonal_elements_batch() methods
+        basis: (n_basis, n_sites) configurations
+        k: Number of eigenvalues to compute
+        which: 'SA' for smallest algebraic
+        shift_invert: Use shift-invert mode with sigma=E_HF for faster convergence
+        tol: Convergence tolerance for eigsh (0 = machine precision)
+
+    Returns:
+        eigenvalues: (k,) tensor
+        eigenvectors: (n_basis, k) tensor
+    """
+    from scipy.sparse import coo_matrix, diags
+    from scipy.sparse.linalg import eigsh
+
+    n = len(basis)
+    device = basis.device
+
+    # Off-diagonal elements via vectorized batch method
+    rows, cols, vals = hamiltonian.get_sparse_matrix_elements(basis)
+    rows_np = rows.cpu().numpy()
+    cols_np = cols.cpu().numpy()
+    vals_np = vals.cpu().numpy().astype(np.float64)
+
+    H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n))
+
+    # Diagonal elements (vectorized, no Python loop)
+    diag_np = hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+
+    # Symmetrize off-diagonal + add diagonal
+    H_csr = H_coo.tocsr()
+    H_csr = 0.5 * (H_csr + H_csr.T)
+    H_csr = H_csr + diags(diag_np, 0, shape=(n, n), format='csr')
+
+    k_eig = min(k, n - 1)
+
+    # Single-config basis: eigsh requires k >= 1 but n-1 = 0.
+    # The answer is trivially the diagonal element.
+    if k_eig < 1:
+        eigenvalues = torch.tensor([diag_np[0]], dtype=torch.float64)
+        eigenvectors = torch.eye(n, 1, dtype=torch.float64)
+        return eigenvalues.to(device), eigenvectors.to(device)
+
+    if shift_invert:
+        sigma = float(hamiltonian.diagonal_element(
+            hamiltonian.get_hf_state()
+        ).item())
+        eigenvalues, eigenvectors = eigsh(
+            H_csr, k=k_eig, sigma=sigma, which='SA', tol=tol
+        )
+    else:
+        eigenvalues, eigenvectors = eigsh(
+            H_csr, k=k_eig, which=which, tol=tol
+        )
+
+    evals_t = torch.from_numpy(eigenvalues).to(device)
+    evecs_t = torch.from_numpy(eigenvectors).to(device)
+    return evals_t, evecs_t
+
+
 def gpu_expm_multiply(
     A: torch.Tensor,
     v: torch.Tensor,
@@ -167,9 +347,9 @@ def gpu_expm_multiply(
     device = v.device
     dtype = v.dtype
 
-    # For matrices that fit in GPU memory, direct matrix exponential is fastest
-    # GPU memory is typically 16-48GB, so 10k x 10k complex128 = 1.6GB is safe
-    if n < 10000:
+    # Sparse tensors must use Lanczos (matrix_exp doesn't support sparse)
+    # For small dense matrices, direct matrix exponential is fastest
+    if n < 10000 and not A.is_sparse:
         return _expm_multiply_dense(A, v, t)
 
     # For very large systems, use Krylov approximation to save memory
@@ -214,6 +394,9 @@ def _expm_multiply_lanczos(
     if not v.is_complex():
         v = v.to(torch.complex128)
 
+    # Clamp krylov_dim to matrix size (Krylov subspace is at most n-dimensional)
+    krylov_dim = min(krylov_dim, n)
+
     # Normalize input vector
     beta = torch.linalg.norm(v)
     if beta < tol:
@@ -236,10 +419,18 @@ def _expm_multiply_lanczos(
         # Compute diagonal element
         alpha[j] = torch.vdot(V[:, j], w).real
 
-        # Orthogonalize against previous vectors
+        # Orthogonalize against previous vectors (3-term recurrence)
         if j > 0:
             w = w - beta_vec[j] * V[:, j - 1]
         w = w - alpha[j] * V[:, j]
+
+        # Full reorthogonalization against ALL previous Lanczos vectors.
+        # In finite-precision arithmetic, the 3-term recurrence loses
+        # orthogonality (Paige 1980). This is O(j*n) per step but critical
+        # for numerical correctness when krylov_dim > ~10.
+        for i in range(j + 1):
+            proj = torch.vdot(V[:, i], w)
+            w = w - proj * V[:, i]
 
         # Compute off-diagonal element
         beta_new = torch.linalg.norm(w).real

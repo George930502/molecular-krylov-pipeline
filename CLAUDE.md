@@ -4,7 +4,20 @@
 
 Quantum chemistry pipeline for computing molecular ground-state energies. Combines **Normalizing Flow-Assisted Neural Quantum States (NF-NQS)** with **Krylov subspace diagonalization** to systematically converge toward FCI-level accuracy.
 
-The core idea: use a normalizing flow to discover high-probability molecular configurations (determinants), then diagonalize the Hamiltonian projected onto that basis. Two subspace solvers are available: **SKQD** (Krylov time evolution) and **SQD** (IBM's sampling-based batch diagonalization).
+The core idea: use a normalizing flow to discover high-probability molecular configurations (determinants), then diagonalize the Hamiltonian projected onto that basis. The primary subspace solver is **SKQD** (Krylov time evolution). **SQD** (IBM's sampling-based batch diagonalization) is also available but performs poorly on systems beyond 16 qubits.
+
+### Scale-up Goal
+
+The pipeline's target is scaling to **40+ qubits**. Two parallel challenges:
+1. **SKQD (core solver)**: Must handle 40Q-scale subspaces — sparse eigensolve, memory management, Krylov expansion efficiency
+2. **NF (auxiliary sampler)**: Must generate useful configs beyond Direct-CI (HF+S+D) at 40Q scale, where CISD is insufficient. **Current NF architecture is non-autoregressive and cannot capture inter-orbital correlations** — upgrading to autoregressive is a prerequisite for NF to add value at scale.
+
+### Current Status (as of 2026-03-07)
+
+- **SKQD**: Proven effective (7/7 molecules PASS chemical accuracy on STO-3G). Sparse eigensolver, OOM guards, and Numba JIT added. Not yet tested at 40Q scale.
+- **NF**: Bug fixes done (SigmoidTopK, Plackett-Luce, entropy scaling). But non-autoregressive architecture is a fundamental limitation. NF shows negligible improvement over Direct-CI on STO-3G (0.7-21% better, already within chemical accuracy). Untested on larger basis sets where NF should matter more.
+- **SQD**: Fails on CH4 (18Q) and N2 (20Q) with errors 2.4-12.1 mHa. SKQD is 8-193x better. SQD is not the focus.
+- **Basis sets**: Only STO-3G implemented. cc-pVDZ or CAS(10,10)+ needed for meaningful 40Q benchmarks and NF validation.
 
 ### Key References (PDFs in `papers/`)
 
@@ -28,15 +41,16 @@ The core idea: use a normalizing flow to discover high-probability molecular con
 |-----------|------------|
 | Language | Python 3.10+ |
 | Package manager | uv (hatchling build) |
-| Neural networks | PyTorch >= 2.0 |
+| Neural networks | PyTorch >= 2.0 (2.10.0+cu130 on DGX Spark) |
 | Molecular integrals | PySCF >= 2.3 |
 | Eigensolvers | SciPy (CPU) / CuPy (GPU) |
 | Quantum circuits | CUDA-Q (optional, graceful fallback) |
 | Formatting | black (line-length 100) |
 | Linting | ruff (line-length 100) |
 | Type checking | mypy |
-| Testing | pytest |
+| Testing | pytest (177 tests, all passing) |
 | Containerization | Docker (pytorch/pytorch:2.2.0-cuda12.1) |
+| Hardware | NVIDIA DGX Spark (GB10, ARM64, 128GB UMA, SM121) |
 
 ---
 
@@ -60,13 +74,15 @@ Stage 3: Subspace Diagonalization
   └── SQD: S-CORE config recovery, batch diag, energy-variance extrapolation
 ```
 
+**Note on NF force-disable**: `adapt_to_system_size()` (called by default via `auto_adapt=True`) unconditionally sets `skip_nf_training=True` for all molecular systems. The ablation study bypassed this with `auto_adapt=False`. This means **normal pipeline usage always runs Direct-CI, never NF**.
+
 ### Module Map
 
 ```
 src/
 ├── pipeline.py                    # PipelineConfig + FlowGuidedKrylovPipeline orchestrator
 ├── flows/
-│   ├── particle_conserving_flow.py  # NF that enforces exact electron count
+│   ├── particle_conserving_flow.py  # NF that enforces exact electron count (SigmoidTopK)
 │   ├── discrete_flow.py             # NF for spin systems (no particle constraint)
 │   ├── physics_guided_training.py   # Co-trains NF + NQS (molecular systems)
 │   └── training.py                  # Legacy trainer for spin systems
@@ -90,19 +106,20 @@ src/
 │   └── utils.py
 └── utils/
     ├── connection_cache.py          # GPU-accelerated Hamiltonian connection cache
-    ├── gpu_linalg.py                # gpu_eigh, gpu_eigsh, gpu_expm_multiply
-    └── system_scaler.py             # Auto-scale params by system size tier
+    └── gpu_linalg.py                # gpu_eigh, gpu_eigsh, gpu_expm_multiply
 ```
+
+Note: `src/utils/system_scaler.py` does NOT exist despite being listed in older docs. Stale reference.
 
 ### Key Classes
 
-- **`PipelineConfig`** — Master dataclass. `subspace_mode`: `"skqd"` or `"sqd"`. `skip_nf_training`: enables Direct-CI mode. `adapt_to_system_size()` auto-scales parameters.
-- **`FlowGuidedKrylovPipeline`** — Orchestrator. `.run()` executes all 3 stages.
-- **`MolecularHamiltonian`** — Second-quantized electronic Hamiltonian from PySCF integrals. Implements Slater-Condon rules. Factory functions: `create_h2_hamiltonian()`, `create_lih_hamiltonian()`, etc.
-- **`ParticleConservingFlowSampler`** — Normalizing flow that always produces configs with exactly n_alpha + n_beta electrons. Uses `GumbelTopK` (Gumbel-Softmax straight-through estimator) for differentiable top-k orbital selection.
-- **`SampleBasedKrylovDiagonalization`** / **`FlowGuidedSKQD`** — Krylov subspace construction via time evolution. Key knob: `SKQDConfig.max_diag_basis_size=15000` caps dense diag to prevent OOM/hangs.
-- **`SQDSolver`** — IBM's SQD with two sub-modes: **SQD-Clean** (`noise_rate=0`, default) and **SQD-Recovery** (`noise_rate>0`, injects depolarizing noise then runs S-CORE config recovery).
-- **`PhysicsGuidedFlowTrainer`** — Co-trains NF + NQS. Default loss is **pure cross-entropy** weighted by `|E|` (`physics_weight=0.0`, `entropy_weight=0.0`). Uses `ConnectionCache` with warmup (HF + singles + doubles pre-cached).
+- **`PipelineConfig`** — Master dataclass. `subspace_mode`: `"skqd"` or `"sqd"`. `skip_nf_training`: enables Direct-CI mode. `adapt_to_system_size()` auto-scales parameters and **forces** `skip_nf_training=True`.
+- **`FlowGuidedKrylovPipeline`** — Orchestrator. `.run()` executes all 3 stages. `auto_adapt=True` by default (calls `adapt_to_system_size()`).
+- **`MolecularHamiltonian`** — Second-quantized electronic Hamiltonian from PySCF integrals (FP64). Implements Slater-Condon rules with Numba JIT. Factory functions: `create_h2_hamiltonian()`, `create_lih_hamiltonian()`, etc.
+- **`ParticleConservingFlowSampler`** — Normalizing flow that always produces configs with exactly n_alpha + n_beta electrons. Uses `SigmoidTopK` for differentiable top-k orbital selection with `Plackett-Luce` probability model. **Architecture limitation: non-autoregressive (product-of-marginals) — cannot capture inter-orbital correlations.**
+- **`SampleBasedKrylovDiagonalization`** / **`FlowGuidedSKQD`** — Krylov subspace construction via time evolution. Key knobs: `max_diag_basis_size=15000`, `MAX_FULL_SUBSPACE_SIZE=100000`. Has sparse eigensolver path (`_sparse_ground_state`, threshold=3000).
+- **`SQDSolver`** — IBM's SQD with two sub-modes: **SQD-Clean** (`noise_rate=0`, default) and **SQD-Recovery** (`noise_rate>0`, injects depolarizing noise then runs S-CORE config recovery). Fails on systems >16Q.
+- **`PhysicsGuidedFlowTrainer`** — Co-trains NF + NQS. Uses cross-entropy loss with `entropy_weight=0.05` and exponential temperature annealing. `ConnectionCache` with warmup. **Known bug: `physics_guided_training.py:1104` has NameError (`configs` should be `all_configs`).**
 
 ---
 
@@ -119,14 +136,15 @@ uv sync --extra cuda             # Include CuPy for GPU acceleration
 ### Testing
 
 ```bash
-uv run pytest                                  # Run all tests (excludes @slow)
+uv run pytest                                  # Run all tests (177 tests, excludes @slow)
 uv run pytest -m slow                          # Run only slow integration tests
+uv run pytest -m molecular                     # Molecular-only tests (need PySCF)
 uv run pytest tests/test_pipeline.py           # Single file
 uv run pytest tests/test_pipeline.py -k "test_basic"  # Single test
 uv run pytest --cov=src --cov-report=term      # With coverage
 ```
 
-Note: `tests/` is gitignored. Tests with `@pytest.mark.slow` exist in `test_pipeline.py`. CUDA-only tests auto-skip on CPU. Molecular tests auto-skip if PySCF is unavailable.
+Note: `tests/` is gitignored. `tests/conftest.py` has session-scoped molecular and GPU fixtures. Molecular tests auto-skip if PySCF unavailable. CUDA tests auto-skip on CPU.
 
 ### Formatting & Linting
 
@@ -173,7 +191,7 @@ results = pipeline.run()
 - **Immutability preferred**: Return new objects rather than mutating in place
 - **Type hints**: Used throughout, but `mypy` configured with `ignore_missing_imports = true`
 - **Docstrings**: Module-level and class-level docstrings present. NumPy-style parameter docs.
-- **Tests**: pytest with class-based grouping (`class TestXxx`), `@pytest.fixture` for setup. Tests import via `sys.path.insert` from `src/`.
+- **Tests**: pytest with class-based grouping (`class TestXxx`), `@pytest.fixture` for setup. Tests import via `sys.path.insert` from `src/`. `conftest.py` provides session-scoped molecular and GPU fixtures.
 - **Commit style**: Conventional commits — `feat:`, `fix:`, `refactor:`, `perf:`, `docs:`, `test:`, `chore:`
 
 ---
@@ -184,16 +202,15 @@ results = pipeline.run()
 |------|--------|---------|----------|-------|
 | small | 4-14 | < 2K | H2, LiH, H2O, BeH2 | Direct diag works, exact FCI achievable |
 | medium | 16-18 | 2K-20K | NH3, CH4 | Direct-CI still hits FCI |
-| large | 20-24 | 14K-100K | N2, CO, HCN | NF training or large Direct-CI needed |
-| very_large | 26+ | 1M+ | C2H4 (9M) | NF essential, memory-sensitive |
+| large | 20-24 | 14K-100K | N2, CO, HCN | Direct-CI sufficient on STO-3G; NF needed with larger basis sets |
+| very_large | 26-40 | 100K-10M+ | C2H4, CAS systems | NF essential for finding triples/quadruples beyond CISD |
+| target | 40+ | 10M+ | [2Fe-2S] CAS(30,20) | Requires autoregressive NF + sparse SKQD |
 
-`PipelineConfig.adapt_to_system_size(n_valid_configs)` auto-scales training parameters, basis limits, and Krylov settings per tier. It always forces `skip_nf_training=True` (Direct-CI mode) for molecular systems.
-
-Note: `src/utils/system_scaler.py` contains a separate, more advanced `SystemScaler` class (6 tiers, logarithmic scaling, quality presets). It is a standalone utility and is **not** used by the pipeline's `adapt_to_system_size()`.
+`PipelineConfig.adapt_to_system_size(n_valid_configs)` auto-scales training parameters, basis limits, and Krylov settings per tier. It **unconditionally forces** `skip_nf_training=True` for all molecular systems.
 
 ### Available Molecular Systems
 
-All factory functions in `src/hamiltonians/molecular.py` use **STO-3G** basis. Reference energies come from `MolecularHamiltonian.fci_energy()` at runtime.
+All factory functions in `src/hamiltonians/molecular.py` use **STO-3G** basis set (FP64 integrals). Reference energies come from `MolecularHamiltonian.fci_energy()` at runtime.
 
 | Factory function | Molecule | Default geometry | Electrons | Orbitals | Configs |
 |-----------------|----------|-----------------|-----------|----------|---------|
@@ -205,7 +222,18 @@ All factory functions in `src/hamiltonians/molecular.py` use **STO-3G** basis. R
 | `create_ch4_hamiltonian()` | CH4 | C-H=1.09 A, tetrahedral | 10 | 9 | 15,876 |
 | `create_n2_hamiltonian(bond_length=1.10)` | N2 | 1.10 A | 14 | 10 | 14,400 |
 
-Note: `create_c2h4_hamiltonian` does **not** exist despite C2H4 being referenced in benchmarks. C2H4 benchmarks construct the Hamiltonian manually.
+**Basis set limitation**: STO-3G is only acceptable for method development. 2026 publication standard requires cc-pVDZ minimum. IBM uses N2/cc-pVDZ CAS(10,26o) as de facto SQD benchmark.
+
+---
+
+## Ablation Study Results (RESULTS.md)
+
+### Key Findings from 7-experiment study on STO-3G
+
+1. **SKQD >> SQD**: SKQD achieves chemical accuracy on all 7 systems (7/7 PASS). SQD fails on CH4 and N2 (errors 2.4-12.1 mHa). Gap is 8-193x. **SKQD is the correct solver.**
+2. **Direct-CI is sufficient on STO-3G**: HF + singles + doubles capture ~99.99% correlation energy. NF adds marginal improvement (0.7-21%).
+3. **NF's value should grow with system size**: At STO-3G, Direct-CI leaves no gap for NF to fill. On cc-pVDZ or CAS(10,10)+, CISD only recovers ~85-90% — NF's ability to find important triples/quadruples becomes critical.
+4. **NF training is expensive**: CH4 takes 76 min NF training vs 7.5 min SKQD. Cost-benefit only makes sense when NF finds configs that Direct-CI cannot.
 
 ---
 
@@ -218,15 +246,29 @@ Note: `create_c2h4_hamiltonian` does **not** exist despite C2H4 being referenced
 - **Essential configs (HF + singles + doubles) must survive all pipeline stages.** The ground state wavefunction is dominated by these. If they're filtered out, accuracy collapses.
 - Hamiltonian matrix elements follow **Slater-Condon rules**: only single and double excitations have non-zero off-diagonal elements.
 
+### NF Architecture Limitation
+
+- **Current NF is non-autoregressive** (product-of-marginals): P(config) = P(o₁) × P(o₂) × ... × P(oₙ). Cannot capture inter-orbital correlations.
+- **Autoregressive is required** for 40Q+: P(config) = P(o₁) × P(o₂|o₁) × ... × P(oₙ|o₁...oₙ₋₁). QiankunNet (Nature Comms 2025) proved autoregressive transformer achieves 99.9% FCI on 30 spin orbitals.
+- **Upgrading NF will not break SKQD** (SKQD accepts any config set), but will change SKQD's optimal hyperparameters (krylov_dim, dt, max_diag_basis_size, convergence thresholds, diversity budgets). Recalibration required after NF upgrade.
+
 ### Performance
 
-- For large systems (>20K configs), skip per-dimension Krylov diagnostics — they cause hangs.
-- `SKQDConfig.max_diag_basis_size=15000` caps the subspace for dense diag. This is the primary OOM/hang prevention knob.
-- `SKQDConfig.max_new_configs_per_krylov_step=1000` caps the expansion rate per Krylov step.
+- **FP64 integrals**: h1e/h2e stored as FP64 (torch.float64). All Hamiltonian matrix elements computed in FP64. MATRIX_ELEMENT_TOL = 1e-12.
+- **Numba JIT**: `get_connections` uses Numba-compiled functions for 18.7x speedup.
+- **Sparse eigensolver**: SKQD uses sparse eigsh for subspaces > 3000 configs.
+- `SKQDConfig.max_diag_basis_size=15000` caps the subspace for dense diag. `MAX_FULL_SUBSPACE_SIZE=100000` is the hard OOM guard.
 - `ConnectionCache` (LRU, GPU-encoded keys) prevents redundant Hamiltonian connection recomputation.
-- Time evolution uses subspace method for molecules (10-100x smaller than full Hilbert space) and Lanczos (`gpu_expm_multiply`) for large spin systems.
-- `max_connections_per_config`, `diagonal_only_warmup_epochs`, `stochastic_connections_fraction` are knobs for large-system training speed.
-- **TF32 global side-effect**: Importing `src/flows/physics_guided_training.py` sets `torch.set_float32_matmul_precision('high')` and enables TF32 for CUDA matmul and cuDNN. This affects all subsequent torch operations in the process.
+- **TF32 global side-effect**: Importing `src/flows/physics_guided_training.py` sets `torch.set_float32_matmul_precision('high')` and enables TF32 for CUDA matmul and cuDNN.
+
+### DGX Spark Specifics
+
+- **FP64**: 0.48 TFLOPS (1:64 vs FP32). NVIDIA says FP64 is NOT a target use case. Eigensolves should use CPU SciPy for small systems, GPU sparse eigsh only for large.
+- **TF32**: 53.3 TFLOPS. Use for NF training.
+- **UMA**: 128GB shared CPU/GPU memory. Zero-copy advantage for large matrices.
+- **Pageable memory**: 50x slowdown for small H2D copies on ARM64/UMA. Use pinned memory or allocate directly on GPU.
+- **torch.compile**: Broken on SM121 (Triton treats as SM80). Use eager mode.
+- **PyTorch**: 2.10.0+cu130 recommended.
 
 ### Code Patterns
 
@@ -235,12 +277,10 @@ Note: `create_c2h4_hamiltonian` does **not** exist despite C2H4 being referenced
 - CuPy is optional. GPU eigensolvers fall back to SciPy when `cupy` is unavailable.
 - Docker mounts the workspace at `/app` with `PYTHONPATH=/app/src`.
 
-### Testing Caveats
+### Known Bugs
 
-- Some tests reference older API signatures (e.g., `nf_coupling_layers`, `extract_basis()`). The test suite may need updates to match the current `remove-pt2-add-sqd` branch API.
-- Molecular tests require PySCF, which needs ~1GB RAM for integral computation on larger systems.
-- Tests use small spin systems (4-site Ising) for speed. Molecular integration tests are in `examples/`.
-- No `conftest.py` exists — fixtures are defined inside test classes, not shared.
+- ~~**`physics_guided_training.py:1113`**: NameError — `configs` should be `all_configs`.~~ **FIXED** (PR 2.6).
+- ~~**`pipeline.py:217`**: `adapt_to_system_size()` unconditionally forces `skip_nf_training=True`.~~ **FIXED** (PR 2.1). Now conditional: >20K configs enables NF, ≤20K skips. `_user_set_skip_nf` preserves explicit override.
 
 ### Diversity Selection Defaults
 
@@ -255,3 +295,33 @@ The `DiversityConfig` excitation-rank budget is a strong physics-informed prior:
 | 4+ | 5% | Higher excitations |
 
 `min_hamming_distance=2` enforces diversity. DPP-greedy selection maximizes `weight * hamming_distance` within each bucket.
+
+---
+
+## Competitive Landscape (March 2026)
+
+### Direct Competitors (Generative Model + CI/Diag)
+
+| Method | Architecture | Scale | Key Advantage |
+|--------|-------------|-------|---------------|
+| QiankunNet | Autoregressive Transformer + MCTS | 30 spin orbs, 99.9% FCI | Proven architecture |
+| NNQS-SCI | Transformer + Selected CI | 152 spin orbs | Best scaling |
+| NNCI | NN classifier + active learning | N2, 4×10⁵ dets | Simplest approach |
+| PIGen-SQD | RBM + tensor decomposition | 52 qubits | IBM ecosystem |
+| AB-SND | Autoregressive NN + basis opt | molecular systems | Classical, no quantum HW |
+
+### Classical Baselines
+
+| Method | Best Result (2025-2026) |
+|--------|----------------------|
+| GPU-DMRG (SandboxAQ) | CAS(82,82) orbital-optimized, CAS(113,76) single-point |
+| SHCI | Cr2 28e/76o, 2 billion determinants |
+| FCIQMC-GAS | 96e/159o |
+
+**CAS(30,20) for [2Fe-2S] is "trivially classical" for DMRG.** The quantum/NF advantage threshold is currently beyond CAS(100,100).
+
+### Critical Papers
+
+- Reinholdt et al. (JCTC 2025): "Critical Limitations in QSCI" — QSCI less compact than classical SCI
+- MIT review (arXiv:2508.20972): Classical methods superior for ~20 years
+- IBM SqDRIFT (Science, March 2026): 72 qubits, half-Möbius molecule

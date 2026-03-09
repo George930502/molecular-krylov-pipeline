@@ -18,6 +18,393 @@ try:
 except ImportError:
     from hamiltonians.base import Hamiltonian
 
+try:
+    import numba
+    from numba import njit, int64, float64, int32
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+# Tolerance for filtering computed matrix elements.
+# All integral paths (sequential, vectorized, Numba) use FP64, so no
+# accumulation-order precision issues. 1e-12 Ha is well below chemical accuracy.
+MATRIX_ELEMENT_TOL = 1e-12
+
+# =============================================================================
+# Numba JIT-compiled functions for get_connections acceleration
+# These are module-level pure functions (no class state) for Numba compatibility.
+# =============================================================================
+
+if NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def numba_jw_sign_single(config, p, q):
+        """
+        JW sign for single excitation a+_p a_q.
+
+        Sign = (-1)^(number of occupied sites between p and q).
+        """
+        if p == q:
+            return 1
+        low = min(p, q)
+        high = max(p, q)
+        count = 0
+        for i in range(low + 1, high):
+            count += config[i]
+        if (count & 1) == 0:
+            return 1
+        return -1
+
+    @njit(cache=True)
+    def numba_jw_sign_double(config, p, r, q, s):
+        """
+        JW sign for double excitation a+_p a+_r a_s a_q.
+
+        Operators applied RIGHT-TO-LEFT:
+        1. a_q (annihilate q) on original config
+        2. a_s (annihilate s) on config with q removed
+        3. a+_r (create r) on config with q,s removed
+        4. a+_p (create p) on config with q,s removed, r added
+        """
+        total_count = 0
+
+        # 1. a_q: count occupied below q
+        c_q = 0
+        for i in range(q):
+            c_q += config[i]
+        total_count += c_q
+
+        # 2. a_s: count occupied below s, adjust for q removal
+        c_s = 0
+        for i in range(s):
+            c_s += config[i]
+        if q < s:
+            c_s -= 1
+        total_count += c_s
+
+        # 3. a+_r: count occupied below r, adjust for q,s removal
+        c_r = 0
+        for i in range(r):
+            c_r += config[i]
+        if q < r:
+            c_r -= 1
+        if s < r:
+            c_r -= 1
+        total_count += c_r
+
+        # 4. a+_p: count occupied below p, adjust for q,s removal and r addition
+        c_p = 0
+        for i in range(p):
+            c_p += config[i]
+        if q < p:
+            c_p -= 1
+        if s < p:
+            c_p -= 1
+        if r < p:
+            c_p += 1
+        total_count += c_p
+
+        if (total_count & 1) == 0:
+            return 1
+        return -1
+
+    @njit(cache=True)
+    def _numba_single_excitations(
+        config, n_orb, J_single, K_single,
+        single_exc_pq, single_exc_hpq,
+    ):
+        """
+        Compute all single excitation connections and matrix elements.
+
+        Returns:
+            conns: list of new configs (numpy arrays)
+            elems: list of matrix element values (float64)
+        """
+        n_sites = len(config)
+
+        # Find occupied/virtual orbitals
+        occ_alpha = np.empty(n_orb, dtype=np.int64)
+        n_occ_a = 0
+        virt_alpha = np.empty(n_orb, dtype=np.int64)
+        n_virt_a = 0
+        for i in range(n_orb):
+            if config[i] == 1:
+                occ_alpha[n_occ_a] = i
+                n_occ_a += 1
+            else:
+                virt_alpha[n_virt_a] = i
+                n_virt_a += 1
+
+        occ_beta = np.empty(n_orb, dtype=np.int64)
+        n_occ_b = 0
+        virt_beta = np.empty(n_orb, dtype=np.int64)
+        n_virt_b = 0
+        for i in range(n_orb):
+            if config[i + n_orb] == 1:
+                occ_beta[n_occ_b] = i
+                n_occ_b += 1
+            else:
+                virt_beta[n_virt_b] = i
+                n_virt_b += 1
+
+        # Pre-allocate (upper bound: n_exc * 2 for alpha + beta)
+        max_conns = len(single_exc_pq) * 2
+        conn_buf = np.empty((max_conns, n_sites), dtype=np.int64)
+        elem_buf = np.empty(max_conns, dtype=np.float64)
+        count = 0
+
+        # Build occupied sets as boolean arrays for O(1) lookup
+        occ_a_set = np.zeros(n_orb, dtype=np.int64)
+        for i in range(n_occ_a):
+            occ_a_set[occ_alpha[i]] = 1
+        virt_a_set = np.zeros(n_orb, dtype=np.int64)
+        for i in range(n_virt_a):
+            virt_a_set[virt_alpha[i]] = 1
+        occ_b_set = np.zeros(n_orb, dtype=np.int64)
+        for i in range(n_occ_b):
+            occ_b_set[occ_beta[i]] = 1
+        virt_b_set = np.zeros(n_orb, dtype=np.int64)
+        for i in range(n_virt_b):
+            virt_b_set[virt_beta[i]] = 1
+
+        n_exc = len(single_exc_pq)
+        for idx in range(n_exc):
+            p = single_exc_pq[idx, 0]
+            q = single_exc_pq[idx, 1]
+            h_pq = single_exc_hpq[idx]
+
+            # Alpha: q -> p
+            if occ_a_set[q] == 1 and virt_a_set[p] == 1:
+                val = h_pq
+                for ri in range(n_occ_a):
+                    r = occ_alpha[ri]
+                    val += J_single[p, q, r] - K_single[p, q, r]
+                for ri in range(n_occ_b):
+                    r = occ_beta[ri]
+                    val += J_single[p, q, r]
+
+                if abs(val) > 1e-12:
+                    for k in range(n_sites):
+                        conn_buf[count, k] = config[k]
+                    conn_buf[count, q] = 0
+                    conn_buf[count, p] = 1
+                    sign = numba_jw_sign_single(config, p, q)
+                    elem_buf[count] = sign * val
+                    count += 1
+
+            # Beta: q -> p
+            if occ_b_set[q] == 1 and virt_b_set[p] == 1:
+                val = h_pq
+                for ri in range(n_occ_b):
+                    r = occ_beta[ri]
+                    val += J_single[p, q, r] - K_single[p, q, r]
+                for ri in range(n_occ_a):
+                    r = occ_alpha[ri]
+                    val += J_single[p, q, r]
+
+                if abs(val) > 1e-12:
+                    p_idx = p + n_orb
+                    q_idx = q + n_orb
+                    for k in range(n_sites):
+                        conn_buf[count, k] = config[k]
+                    conn_buf[count, q_idx] = 0
+                    conn_buf[count, p_idx] = 1
+                    sign = numba_jw_sign_single(config, p_idx, q_idx)
+                    elem_buf[count] = sign * val
+                    count += 1
+
+        return conn_buf[:count], elem_buf[:count]
+
+    @njit(cache=True)
+    def _numba_double_excitations(config, n_orb, h2e):
+        """
+        Compute all double excitation connections and matrix elements.
+
+        Handles alpha-alpha, beta-beta, and alpha-beta double excitations
+        following Slater-Condon rules.
+        """
+        n_sites = len(config)
+
+        # Find occupied/virtual orbitals
+        occ_alpha = np.empty(n_orb, dtype=np.int64)
+        n_occ_a = 0
+        virt_alpha = np.empty(n_orb, dtype=np.int64)
+        n_virt_a = 0
+        for i in range(n_orb):
+            if config[i] == 1:
+                occ_alpha[n_occ_a] = i
+                n_occ_a += 1
+            else:
+                virt_alpha[n_virt_a] = i
+                n_virt_a += 1
+
+        occ_beta = np.empty(n_orb, dtype=np.int64)
+        n_occ_b = 0
+        virt_beta = np.empty(n_orb, dtype=np.int64)
+        n_virt_b = 0
+        for i in range(n_orb):
+            if config[i + n_orb] == 1:
+                occ_beta[n_occ_b] = i
+                n_occ_b += 1
+            else:
+                virt_beta[n_virt_b] = i
+                n_virt_b += 1
+
+        # Upper bound on doubles
+        n_aa = n_occ_a * (n_occ_a - 1) // 2 * n_virt_a * (n_virt_a - 1) // 2
+        n_bb = n_occ_b * (n_occ_b - 1) // 2 * n_virt_b * (n_virt_b - 1) // 2
+        n_ab = n_occ_a * n_occ_b * n_virt_a * n_virt_b
+        max_doubles = n_aa + n_bb + n_ab
+        if max_doubles == 0:
+            return np.empty((0, n_sites), dtype=np.int64), np.empty(0, dtype=np.float64)
+
+        conn_buf = np.empty((max_doubles, n_sites), dtype=np.int64)
+        elem_buf = np.empty(max_doubles, dtype=np.float64)
+        count = 0
+
+        # Alpha-Alpha doubles
+        for i in range(n_occ_a):
+            q = occ_alpha[i]
+            for j in range(i + 1, n_occ_a):
+                s = occ_alpha[j]
+                for k in range(n_virt_a):
+                    p = virt_alpha[k]
+                    for l in range(k + 1, n_virt_a):
+                        r = virt_alpha[l]
+                        val = h2e[p, q, r, s] - h2e[p, s, r, q]
+                        if abs(val) > 1e-12:
+                            for m in range(n_sites):
+                                conn_buf[count, m] = config[m]
+                            conn_buf[count, q] = 0
+                            conn_buf[count, s] = 0
+                            conn_buf[count, p] = 1
+                            conn_buf[count, r] = 1
+                            sign = numba_jw_sign_double(config, p, r, q, s)
+                            elem_buf[count] = sign * val
+                            count += 1
+
+        # Beta-Beta doubles
+        for i in range(n_occ_b):
+            q = occ_beta[i]
+            for j in range(i + 1, n_occ_b):
+                s = occ_beta[j]
+                for k in range(n_virt_b):
+                    p = virt_beta[k]
+                    for l in range(k + 1, n_virt_b):
+                        r = virt_beta[l]
+                        val = h2e[p, q, r, s] - h2e[p, s, r, q]
+                        if abs(val) > 1e-12:
+                            q_idx = q + n_orb
+                            s_idx = s + n_orb
+                            p_idx = p + n_orb
+                            r_idx = r + n_orb
+                            for m in range(n_sites):
+                                conn_buf[count, m] = config[m]
+                            conn_buf[count, q_idx] = 0
+                            conn_buf[count, s_idx] = 0
+                            conn_buf[count, p_idx] = 1
+                            conn_buf[count, r_idx] = 1
+                            sign = numba_jw_sign_double(config, p_idx, r_idx, q_idx, s_idx)
+                            elem_buf[count] = sign * val
+                            count += 1
+
+        # Alpha-Beta doubles (no exchange term)
+        for i in range(n_occ_a):
+            q = occ_alpha[i]
+            for j in range(n_occ_b):
+                s = occ_beta[j]
+                for k in range(n_virt_a):
+                    p = virt_alpha[k]
+                    for l in range(n_virt_b):
+                        r = virt_beta[l]
+                        val = h2e[p, q, r, s]
+                        if abs(val) > 1e-12:
+                            s_idx = s + n_orb
+                            r_idx = r + n_orb
+                            for m in range(n_sites):
+                                conn_buf[count, m] = config[m]
+                            conn_buf[count, q] = 0
+                            conn_buf[count, s_idx] = 0
+                            conn_buf[count, p] = 1
+                            conn_buf[count, r_idx] = 1
+                            sign = numba_jw_sign_double(config, p, r_idx, q, s_idx)
+                            elem_buf[count] = sign * val
+                            count += 1
+
+        return conn_buf[:count], elem_buf[:count]
+
+    def numba_get_connections(config_np, n_orb, h1e, h2e, J_single, K_single, single_exc_data):
+        """
+        Numba-accelerated get_connections.
+
+        Drop-in replacement for MolecularHamiltonian.get_connections(),
+        operating on numpy arrays directly.
+
+        Args:
+            config_np: Configuration as numpy int64 array (n_sites,)
+            n_orb: Number of spatial orbitals
+            h1e: One-electron integrals (n_orb, n_orb)
+            h2e: Two-electron integrals (n_orb, n_orb, n_orb, n_orb)
+            J_single: Precomputed Coulomb tensor J[p,q,r] = h2e[p,q,r,r]
+            K_single: Precomputed exchange tensor K[p,q,r] = h2e[p,r,r,q]
+            single_exc_data: List of (p, q, h_pq) tuples for non-zero h1e elements
+
+        Returns:
+            (connected_configs, matrix_elements) as numpy arrays
+        """
+        config_np = np.asarray(config_np, dtype=np.int64)
+
+        # Convert single_exc_data to arrays for Numba
+        n_exc = len(single_exc_data)
+        if n_exc > 0:
+            single_exc_pq = np.empty((n_exc, 2), dtype=np.int64)
+            single_exc_hpq = np.empty(n_exc, dtype=np.float64)
+            for i, (p, q, h_pq) in enumerate(single_exc_data):
+                single_exc_pq[i, 0] = p
+                single_exc_pq[i, 1] = q
+                single_exc_hpq[i] = h_pq
+        else:
+            single_exc_pq = np.empty((0, 2), dtype=np.int64)
+            single_exc_hpq = np.empty(0, dtype=np.float64)
+
+        # Single excitations — preserve original dtype (float32) to match Python path
+        s_conns, s_elems = _numba_single_excitations(
+            config_np, n_orb,
+            np.ascontiguousarray(J_single),
+            np.ascontiguousarray(K_single),
+            single_exc_pq, single_exc_hpq,
+        )
+
+        # Double excitations — preserve original dtype
+        d_conns, d_elems = _numba_double_excitations(
+            config_np, n_orb,
+            np.ascontiguousarray(h2e),
+        )
+
+        # Combine
+        if len(s_conns) == 0 and len(d_conns) == 0:
+            n_sites = len(config_np)
+            return np.empty((0, n_sites), dtype=np.int64), np.empty(0, dtype=np.float64)
+        elif len(s_conns) == 0:
+            return d_conns, d_elems
+        elif len(d_conns) == 0:
+            return s_conns, s_elems
+        else:
+            return (
+                np.concatenate((s_conns, d_conns), axis=0),
+                np.concatenate((s_elems, d_elems)),
+            )
+
+else:
+    # Fallback stubs when Numba is not available
+    def numba_jw_sign_single(config, p, q):
+        raise ImportError("numba is required for numba_jw_sign_single")
+
+    def numba_jw_sign_double(config, p, r, q, s):
+        raise ImportError("numba is required for numba_jw_sign_double")
+
+    def numba_get_connections(config_np, n_orb, h1e, h2e, J_single, K_single, single_exc_data):
+        raise ImportError("numba is required for numba_get_connections")
+
 
 @dataclass
 class MolecularIntegrals:
@@ -30,6 +417,11 @@ class MolecularIntegrals:
     n_orbitals: int
     n_alpha: int  # Number of alpha electrons
     n_beta: int   # Number of beta electrons
+    # Cache metadata (set by compute_molecular_integrals for FCI caching)
+    _geometry: Optional[list] = None
+    _basis: Optional[str] = None
+    _charge: int = 0
+    _spin: int = 0
 
 
 class MolecularHamiltonian(Hamiltonian):
@@ -65,8 +457,10 @@ class MolecularHamiltonian(Hamiltonian):
 
         self.device = device
         self.integrals = integrals
-        self.h1e = torch.from_numpy(integrals.h1e).float().to(device)
-        self.h2e = torch.from_numpy(integrals.h2e).float().to(device)
+        # FP64 for integrals: PySCF provides FP64 and Slater-Condon J-K subtraction
+        # suffers catastrophic cancellation in FP32. Memory is trivial (n_orb^4 * 8B).
+        self.h1e = torch.from_numpy(integrals.h1e).double().to(device)
+        self.h2e = torch.from_numpy(integrals.h2e).double().to(device)
         self.nuclear_repulsion = integrals.nuclear_repulsion
         self.n_orbitals = integrals.n_orbitals
         self.n_electrons = integrals.n_electrons
@@ -74,6 +468,7 @@ class MolecularHamiltonian(Hamiltonian):
         self.n_beta = integrals.n_beta
 
         # Pre-convert h2e to numpy ONCE (avoids GPU->CPU transfer in get_connections)
+        # Already FP64 from h2e tensor above.
         # Must be done BEFORE _precompute_vectorized_integrals which uses it
         self._h2e_np = self.h2e.cpu().numpy()
 
@@ -116,6 +511,7 @@ class MolecularHamiltonian(Hamiltonian):
         # Precompute Coulomb/Exchange tensors for single excitation Slater-Condon rules
         # J_single[p,q,r] = h2e[p,q,r,r] (Coulomb-type for excitation p<-q with spectator r)
         # K_single[p,q,r] = h2e[p,r,r,q] (Exchange-type for excitation p<-q with spectator r)
+        # Slater-Condon J/K/JK tensors (already FP64 from h2e)
         r_idx = torch.arange(n_orb, device=device)
         self._J_single = self.h2e[:, :, r_idx, r_idx]  # (n_orb, n_orb, n_orb) axes: (p, q, r)
         # h2e[:, r_idx, r_idx, :] gives axes (p, r, q) -> permute to (p, q, r)
@@ -123,7 +519,7 @@ class MolecularHamiltonian(Hamiltonian):
         # Combined tensor: J - K for same-spin contribution
         self._JK_single = self._J_single - self._K_single  # (n_orb, n_orb, n_orb)
 
-        # Numpy versions for sequential get_connections
+        # Numpy versions for sequential/Numba get_connections (FP64 from h2e)
         self._J_single_np = self._J_single.cpu().numpy()
         self._K_single_np = self._K_single.cpu().numpy()
 
@@ -162,7 +558,7 @@ class MolecularHamiltonian(Hamiltonian):
 
         self._single_p = single_p
         self._single_q = single_q
-        self._single_h1e = single_h1e
+        self._single_h1e = single_h1e  # Already FP64 from h1e
 
         # === DOUBLE EXCITATIONS: Same-spin (alpha-alpha, beta-beta) ===
         # Need all (q, s, p, r) where q < s (occupied), p < r (virtual), all distinct
@@ -268,8 +664,47 @@ class MolecularHamiltonian(Hamiltonian):
             self._double_ab_r = torch.empty(0, dtype=torch.long, device=device)
             self._double_ab_h2e = torch.empty(0, device=device)
 
-        # Precompute powers of 2 for integer encoding (on GPU)
-        self._powers_gpu = (2 ** torch.arange(self.num_sites, device=device, dtype=torch.long)).flip(0)
+        # Precompute powers of 2 for integer encoding (on GPU).
+        # For num_sites >= 64, int64 overflows at 2^63, so we split into
+        # two halves. See utils.config_hash for details.
+        if self.num_sites < 64:
+            self._powers_gpu = (
+                2 ** torch.arange(self.num_sites, device=device, dtype=torch.long)
+            ).flip(0)
+            self._powers_gpu_hi = None
+            self._powers_gpu_lo = None
+        else:
+            self._powers_gpu = None  # Cannot use single int64 encoding
+            half = self.num_sites // 2
+            n_lo = self.num_sites - half
+            self._powers_gpu_hi = (
+                2 ** torch.arange(half, device=device, dtype=torch.long)
+            ).flip(0)
+            self._powers_gpu_lo = (
+                2 ** torch.arange(n_lo, device=device, dtype=torch.long)
+            ).flip(0)
+
+    def _config_int_hash(self, configs: torch.Tensor) -> list:
+        """Hash binary configs to integers for fast dict/set lookups.
+
+        Overflow-safe: for num_sites >= 64, returns list of (int, int) tuples
+        instead of plain ints. Both types are hashable and usable as dict keys.
+
+        Args:
+            configs: (n_configs, num_sites) binary tensor on self.device
+
+        Returns:
+            list of int (n_sites < 64) or list of tuple[int, int] (n_sites >= 64)
+        """
+        if self._powers_gpu is not None:
+            # Standard path: single int64 encoding
+            return (configs.long() * self._powers_gpu).sum(dim=1).cpu().tolist()
+        else:
+            # Split path: two halves to avoid int64 overflow
+            half = self.num_sites // 2
+            hash_hi = (configs[:, :half].long() * self._powers_gpu_hi).sum(dim=1)
+            hash_lo = (configs[:, half:].long() * self._powers_gpu_lo).sum(dim=1)
+            return list(zip(hash_hi.cpu().tolist(), hash_lo.cpu().tolist()))
 
     def _precompute_sparse_h2e(self):
         """
@@ -368,7 +803,8 @@ class MolecularHamiltonian(Hamiltonian):
         Returns:
             (batch_size,) diagonal energies
         """
-        configs = configs.to(self.device).float()
+        dtype = self.h1e.dtype  # Match integral precision (FP64)
+        configs = configs.to(device=self.device, dtype=dtype)
         batch_size = configs.shape[0]
         n_orb = self.n_orbitals
 
@@ -378,7 +814,7 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Nuclear repulsion
         energies = torch.full((batch_size,), self.nuclear_repulsion,
-                             device=self.device, dtype=torch.float32)
+                             device=self.device, dtype=dtype)
 
         # One-body: sum_p h_pp * (n_p^alpha + n_p^beta)
         energies += (n_alpha + n_beta) @ self.h1_diag
@@ -476,7 +912,7 @@ class MolecularHamiltonian(Hamiltonian):
                 for r in occ_beta:
                     val += J_single_np[p, q, r]
 
-                if abs(val) > 1e-12:
+                if abs(val) > MATRIX_ELEMENT_TOL:
                     new_config = config_np.copy()
                     new_config[q] = 0
                     new_config[p] = 1
@@ -492,7 +928,7 @@ class MolecularHamiltonian(Hamiltonian):
                 for r in occ_alpha:
                     val += J_single_np[p, q, r]
 
-                if abs(val) > 1e-12:
+                if abs(val) > MATRIX_ELEMENT_TOL:
                     new_config = config_np.copy()
                     new_config[q + n_orb] = 0
                     new_config[p + n_orb] = 1
@@ -516,7 +952,7 @@ class MolecularHamiltonian(Hamiltonian):
                     for l in range(k + 1, n_virt_a):
                         r = virt_alpha[l]
                         val = h2e_np[p, q, r, s] - h2e_np[p, s, r, q]
-                        if abs(val) > 1e-12:
+                        if abs(val) > MATRIX_ELEMENT_TOL:
                             new_config = config_np.copy()
                             new_config[q] = 0
                             new_config[s] = 0
@@ -538,7 +974,7 @@ class MolecularHamiltonian(Hamiltonian):
                     for l in range(k + 1, n_virt_b):
                         r = virt_beta[l]
                         val = h2e_np[p, q, r, s] - h2e_np[p, s, r, q]
-                        if abs(val) > 1e-12:
+                        if abs(val) > MATRIX_ELEMENT_TOL:
                             new_config = config_np.copy()
                             q_idx = q + n_orb
                             s_idx = s + n_orb
@@ -558,7 +994,7 @@ class MolecularHamiltonian(Hamiltonian):
                 for p in virt_alpha:
                     for r in virt_beta:
                         val = h2e_np[p, q, r, s]
-                        if abs(val) > 1e-12:
+                        if abs(val) > MATRIX_ELEMENT_TOL:
                             new_config = config_np.copy()
                             s_idx = s + n_orb
                             r_idx = r + n_orb
@@ -575,7 +1011,7 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Convert to torch tensors once at the end
         connected = torch.from_numpy(np.array(connected_list)).to(device)
-        elements = torch.tensor(elements_list, dtype=torch.float32, device=device)
+        elements = torch.tensor(elements_list, dtype=torch.float64, device=device)
 
         return connected, elements
 
@@ -633,27 +1069,13 @@ class MolecularHamiltonian(Hamiltonian):
         """
         Compute Jordan-Wigner sign for a+_p a_q (numpy version).
 
-        Sign = (-1)^(number of occupied sites between p and q)
-
-        OPTIMIZED: Uses bitwise operations when config is convertible to int.
-        For 28-qubit C2H4: ~10x faster than array slicing.
+        Sign = (-1)^(number of occupied sites between p and q).
+        Uses numpy vectorized slice sum — faster than Python for-loop
+        for all gap sizes due to C-level array operations.
         """
         if p == q:
             return 1
         low, high = min(p, q), max(p, q)
-
-        # Fast path: use bitwise operations for counting
-        # This is much faster than array slicing for large systems
-        if high - low > 3:  # Only beneficial for larger gaps
-            # Create mask for bits between low and high (exclusive)
-            # mask = ((1 << (high - low - 1)) - 1) << (len(config) - high)
-            # But we need to work with the config as bits
-            count = 0
-            for i in range(low + 1, high):
-                count += config[i]
-            return 1 if (count & 1) == 0 else -1
-
-        # Original path for small gaps
         count = config[low + 1:high].sum()
         return 1 if (count & 1) == 0 else -1
 
@@ -767,22 +1189,69 @@ class MolecularHamiltonian(Hamiltonian):
 
     @torch.no_grad()
     def get_connections_vectorized_batch(
-        self, configs: torch.Tensor
+        self, configs: torch.Tensor, max_memory_mb: float = 2048.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         GPU-accelerated batch computation of Hamiltonian connections.
 
-        Processes ALL configurations in parallel using tensor operations.
+        Processes configurations in parallel using tensor operations.
+        Auto-chunks to stay within ``max_memory_mb`` for intermediate tensors.
         This is 10-50x faster than sequential get_connections() calls for large batches.
 
         Args:
             configs: (n_configs, num_sites) basis configurations on GPU
+            max_memory_mb: memory budget for intermediate tensors (default 2048 MB)
 
         Returns:
             all_connected: (total_connections, num_sites) connected configurations
             all_elements: (total_connections,) matrix elements H[i,j]
             batch_indices: (total_connections,) index of source config for each connection
         """
+        n_configs = configs.shape[0]
+
+        # Estimate peak intermediate tensor size per config
+        n_exc_max = max(
+            len(self._single_p) if hasattr(self, '_single_p') else 0,
+            len(self._double_same_p) if hasattr(self, '_double_same_p') else 0,
+            len(self._double_ab_p) if hasattr(self, '_double_ab_p') else 0,
+        )
+        # 5 intermediate tensors × n_exc × 8 bytes per config (float64)
+        bytes_per_config = 5 * n_exc_max * 8
+        max_chunk = max(1, int(max_memory_mb * 1e6 / max(bytes_per_config, 1)))
+
+        if n_configs <= max_chunk:
+            return self._get_connections_vectorized_batch_impl(configs)
+
+        # Chunk processing to stay within memory budget
+        all_connected, all_elements, all_batch_idx = [], [], []
+        for start in range(0, n_configs, max_chunk):
+            end = min(start + max_chunk, n_configs)
+            chunk = configs[start:end]
+            c, e, b = self._get_connections_vectorized_batch_impl(chunk)
+            if len(c) > 0:
+                # Adjust batch indices to global config indices
+                all_connected.append(c)
+                all_elements.append(e)
+                all_batch_idx.append(b + start)
+
+        if not all_connected:
+            device = self.device
+            num_sites = self.num_sites
+            return (
+                torch.empty(0, num_sites, device=device),
+                torch.empty(0, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
+            )
+        return (
+            torch.cat(all_connected, dim=0),
+            torch.cat(all_elements, dim=0),
+            torch.cat(all_batch_idx, dim=0),
+        )
+
+    def _get_connections_vectorized_batch_impl(
+        self, configs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Inner implementation of vectorized batch connections (no chunking)."""
         device = self.device
         configs = configs.to(device)
         n_configs = configs.shape[0]
@@ -837,7 +1306,7 @@ class MolecularHamiltonian(Hamiltonian):
                 full_vals = h_vals + two_body
 
                 # Filter out negligible elements
-                significant = full_vals.abs() > 1e-12
+                significant = full_vals.abs() > MATRIX_ELEMENT_TOL
                 if significant.any():
                     config_idx = config_idx[significant]
                     p_orb = p_orb[significant]
@@ -871,7 +1340,7 @@ class MolecularHamiltonian(Hamiltonian):
                 two_body = (beta_n * JK_pq).sum(dim=1) + (alpha_n * J_pq).sum(dim=1)
                 full_vals = h_vals + two_body
 
-                significant = full_vals.abs() > 1e-12
+                significant = full_vals.abs() > MATRIX_ELEMENT_TOL
                 if significant.any():
                     config_idx = config_idx[significant]
                     p_orb = p_orb[significant]
@@ -1054,9 +1523,10 @@ class MolecularHamiltonian(Hamiltonian):
 
         # Cumulative sum of occupations (for counting occupied sites below index)
         # cumsum[i] = sum of configs[:i] (occupied sites with index < i)
+        configs_f = configs.float()
         cumsum = torch.cat([
             torch.zeros(batch_size, 1, device=device),
-            configs.cumsum(dim=1)[:, :-1]
+            configs_f.cumsum(dim=1)[:, :-1]
         ], dim=1)  # (batch, num_sites)
 
         # Gather cumsum values at each index
@@ -1065,8 +1535,7 @@ class MolecularHamiltonian(Hamiltonian):
         # 1. a_q: count = cumsum[q]
         count_q = cumsum[batch_idx, q]
 
-        # 2. a_s: count = cumsum[s] - (q < s).float() * configs[q]
-        # But configs[q] = 1 (occupied), so just - (q < s).float()
+        # 2. a_s: count = cumsum[s] - (q < s).float()
         count_s = cumsum[batch_idx, s] - (q < s).float()
 
         # 3. a+_r: count = cumsum[r] - (q < r).float() - (s < r).float()
@@ -1105,24 +1574,45 @@ class MolecularHamiltonian(Hamiltonian):
         configs = configs.to(self.device)
         n_configs = configs.shape[0]
 
-        H = torch.zeros(n_configs, n_configs, device=self.device)
+        # SIZE GUARD: refuse to allocate dense matrices that would cause OOM.
+        # n² × 8 bytes (float64): 20000² = 3.2 GB, 50000² = 20 GB, 63504² = 32 GB.
+        # On DGX Spark 128GB UMA, 20000 is a safe upper bound for dense allocation.
+        MAX_DENSE_CONFIGS = 20000
+        if n_configs > MAX_DENSE_CONFIGS:
+            mem_gb = n_configs ** 2 * 8 / 1e9
+            raise MemoryError(
+                f"matrix_elements_fast() refused to build {n_configs}×{n_configs} dense matrix "
+                f"({mem_gb:.1f} GB). Use get_sparse_matrix_elements() + diagonal_elements_batch() "
+                f"for systems with >{MAX_DENSE_CONFIGS} configs."
+            )
+
+        # Memory logging before dense allocation
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from src.utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+        dtype_str = "complex128" if self.h1e.is_complex() else "float64"
+        if log_allocation:
+            log_allocation("matrix_elements_fast", n_configs, dtype=dtype_str, layout="dense")
+
+        H = torch.zeros(n_configs, n_configs, device=self.device, dtype=self.h1e.dtype)
 
         # Vectorized diagonal (already GPU-accelerated)
         H.diagonal().copy_(self.diagonal_elements_batch(configs))
 
-        # Use GPU-based integer encoding for hash lookups
-        # Encode config as integer: sum(config[i] * 2^i) - stays on GPU
-        config_ints = (configs.long() * self._powers_gpu).sum(dim=1)
-        config_ints_cpu = config_ints.cpu().tolist()  # Single transfer
+        # Use overflow-safe integer encoding for hash lookups
+        config_ints_cpu = self._config_int_hash(configs)
         config_hash = {config_ints_cpu[i]: i for i in range(n_configs)}
 
         # Get ALL connections at once using vectorized batch method
         all_connected, all_elements, batch_indices = self.get_connections_vectorized_batch(configs)
 
         if len(all_connected) > 0:
-            # Encode connected configs on GPU
-            connected_ints = (all_connected.long() * self._powers_gpu).sum(dim=1)
-            connected_ints_cpu = connected_ints.cpu().tolist()  # Single transfer
+            # Encode connected configs (overflow-safe)
+            connected_ints_cpu = self._config_int_hash(all_connected)
             batch_indices_cpu = batch_indices.cpu().tolist()  # Single transfer
 
             # B3: Vectorized scatter — build index arrays then assign at once
@@ -1224,10 +1714,7 @@ class MolecularHamiltonian(Hamiltonian):
         Batch compute off-diagonal connections for multiple configurations.
 
         Returns sparse COO format data for efficient matrix construction.
-
-        NOTE: This returns (row_indices, col_indices, values) for sparse matrix
-        construction, NOT the (connected_configs, elements, config_indices) format
-        expected by ConnectionCache.get_connections_batch interface.
+        Uses GPU-accelerated vectorized batch method for speed.
 
         Args:
             configs: (n_configs, num_sites) configurations
@@ -1238,42 +1725,50 @@ class MolecularHamiltonian(Hamiltonian):
         device = self.device
         configs = configs.to(device)
         n_configs = configs.shape[0]
-        n_orb = self.n_orbitals
+
+        # Use vectorized batch method (GPU-accelerated)
+        all_connected, all_elements, batch_indices = self.get_connections_vectorized_batch(configs)
+
+        if len(all_connected) == 0:
+            return (
+                torch.tensor([], dtype=torch.long, device=device),
+                torch.tensor([], dtype=torch.long, device=device),
+                torch.tensor([], dtype=torch.float64, device=device),
+            )
+
+        # Overflow-safe integer encoding for fast lookup
+        config_ints_cpu = self._config_int_hash(configs)
+        config_hash = {config_ints_cpu[i]: i for i in range(n_configs)}
+
+        # Encode connected configs (overflow-safe)
+        connected_ints_cpu = self._config_int_hash(all_connected)
+        batch_indices_cpu = batch_indices.cpu().tolist()
 
         all_rows = []
         all_cols = []
-        all_vals = []
+        val_indices = []
 
-        # Integer encoding for fast lookup
-        powers = (2 ** torch.arange(self.num_sites, device='cpu')).flip(0)
-        configs_cpu = configs.cpu()
-        config_ints = (configs_cpu * powers).sum(dim=1).tolist()
-        config_hash = {config_ints[i]: i for i in range(n_configs)}
-
-        for j in range(n_configs):
-            connected, elements = self.get_connections(configs[j])
-            if len(connected) > 0:
-                connected_cpu = connected.cpu()
-                connected_ints = (connected_cpu * powers).sum(dim=1).tolist()
-
-                for k, conn_int in enumerate(connected_ints):
-                    if conn_int in config_hash:
-                        i = config_hash[conn_int]
-                        all_rows.append(i)
-                        all_cols.append(j)
-                        all_vals.append(elements[k].item())
+        for k in range(len(all_connected)):
+            conn_int = connected_ints_cpu[k]
+            if conn_int in config_hash:
+                i = config_hash[conn_int]
+                j = batch_indices_cpu[k]
+                if i != j:
+                    all_rows.append(i)
+                    all_cols.append(j)
+                    val_indices.append(k)
 
         if len(all_rows) == 0:
             return (
                 torch.tensor([], dtype=torch.long, device=device),
                 torch.tensor([], dtype=torch.long, device=device),
-                torch.tensor([], dtype=torch.float32, device=device),
+                torch.tensor([], dtype=torch.float64, device=device),
             )
 
         return (
             torch.tensor(all_rows, dtype=torch.long, device=device),
             torch.tensor(all_cols, dtype=torch.long, device=device),
-            torch.tensor(all_vals, dtype=torch.float32, device=device),
+            all_elements[torch.tensor(val_indices, device=device)],
         )
 
     def matrix_elements(
@@ -1297,7 +1792,7 @@ class MolecularHamiltonian(Hamiltonian):
         n_bra = configs_bra.shape[0]
         n_ket = configs_ket.shape[0]
 
-        H = torch.zeros(n_bra, n_ket, device=self.device)
+        H = torch.zeros(n_bra, n_ket, device=self.device, dtype=self.h1e.dtype)
 
         # Build bra hash
         bra_hash = {tuple(configs_bra[i].cpu().tolist()): i
@@ -1502,13 +1997,13 @@ class MolecularHamiltonian(Hamiltonian):
                 eigenvalues, eigenvectors = eigsh(H_sparse, k=1, which="SA")
                 psi0 = eigenvectors[:, 0]
                 return fci_energy_val, torch.from_numpy(psi0).to(device)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"WARNING: ground_state eigenvector computation failed: {e}")
 
         # For larger systems, return None for eigenvector
         return fci_energy_val, None
 
-    def fci_energy(self) -> float:
+    def fci_energy(self, use_cache: bool = True) -> float:
         """
         Compute FCI (Full Configuration Interaction) energy.
 
@@ -1519,9 +2014,38 @@ class MolecularHamiltonian(Hamiltonian):
         IMPORTANT: Uses the same matrix_elements() function as the pipeline
         to ensure consistency between FCI reference and pipeline energy.
 
+        Args:
+            use_cache: If True, check/store FCI energy in disk cache.
+
         Returns:
             FCI ground state energy in Hartree
         """
+        # Import cache module once
+        _cache_mod = None
+        _has_cache_meta = (
+            use_cache
+            and hasattr(self.integrals, '_geometry')
+            and self.integrals._geometry is not None
+        )
+        if _has_cache_meta:
+            try:
+                try:
+                    from utils import hamiltonian_cache as _cache_mod
+                except ImportError:
+                    from src.utils import hamiltonian_cache as _cache_mod
+            except Exception:
+                _has_cache_meta = False
+
+        # Try loading from cache
+        if _has_cache_meta:
+            cached_fci = _cache_mod.load_fci_energy(
+                self.integrals._geometry, self.integrals._basis,
+                self.integrals._charge, self.integrals._spin,
+            )
+            if cached_fci is not None:
+                print(f"[HamiltonianCache] Loaded FCI energy from disk cache: {cached_fci:.8f} Ha")
+                return cached_fci
+
         import time
         from itertools import combinations
 
@@ -1547,36 +2071,89 @@ class MolecularHamiltonian(Hamiltonian):
         print(f"Computing FCI energy in {n_configs} configuration subspace...")
         start_time = time.time()
 
+        # Memory logging
+        try:
+            from utils.memory_logger import log_allocation, log_system_memory
+        except ImportError:
+            try:
+                from src.utils.memory_logger import log_allocation, log_system_memory
+            except ImportError:
+                log_allocation = log_system_memory = None
+        if log_allocation:
+            log_system_memory("fci_energy start")
+
         # Stack configs into tensor
         basis_tensor = torch.stack(basis_configs).to(self.device)
 
-        # Use the SAME matrix construction as pipeline for consistency
-        H_fci = self.matrix_elements(basis_tensor, basis_tensor)
+        # Memory-safe path selection:
+        # Dense n×n matrix = n² × 8 bytes (float64).
+        # Threshold 5000: 5000² × 8 = 200 MB (safe).
+        # Above that: use direct sparse construction → O(nnz) ≈ O(200n) memory.
+        SPARSE_FCI_THRESHOLD = 5000
 
-        # Convert to numpy with float64 for numerical stability
-        H_np = H_fci.cpu().numpy().astype(np.float64)
+        if n_configs > SPARSE_FCI_THRESHOLD:
+            # Sparse path: build CSR directly from get_sparse_matrix_elements()
+            # For CAS(10,10) 63504 configs: ~150 MB instead of ~97 GB
+            from scipy.sparse import coo_matrix, diags
+            from scipy.sparse.linalg import eigsh
 
-        # Ensure Hermitian symmetry (critical for correct eigenvalues)
-        H_np = 0.5 * (H_np + H_np.T)
+            print(f"  Using direct sparse construction ({n_configs} > {SPARSE_FCI_THRESHOLD})")
+            mem_dense_gb = n_configs ** 2 * 8 / 1e9
+            mem_sparse_est_mb = n_configs * 200 * 12 / 1e6  # ~200 nnz/row, 12 bytes each
+            print(f"  Memory: sparse ~{mem_sparse_est_mb:.0f} MB vs dense ~{mem_dense_gb:.1f} GB")
 
-        # Verify Hermiticity
-        asymmetry = np.abs(H_np - H_np.T).max()
-        if asymmetry > 1e-10:
-            print(f"WARNING: Hamiltonian asymmetry detected: {asymmetry:.2e}")
+            rows, cols, vals = self.get_sparse_matrix_elements(basis_tensor)
+            rows_np = rows.cpu().numpy()
+            cols_np = cols.cpu().numpy()
+            vals_np = vals.cpu().numpy().astype(np.float64)
 
-        # Diagonalize using numpy for small matrices, sparse for large
-        if n_configs <= 2000:
-            eigenvalues, _ = np.linalg.eigh(H_np)
+            H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n_configs, n_configs))
+            diag_np = self.diagonal_elements_batch(basis_tensor).cpu().numpy().astype(np.float64)
+            H_csr = H_coo.tocsr()
+            H_csr = 0.5 * (H_csr + H_csr.T)
+            H_csr = H_csr + diags(diag_np, 0, shape=(n_configs, n_configs), format='csr')
+
+            eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-12)
             fci_E = float(eigenvalues[0])
         else:
-            from scipy.sparse import csr_matrix
-            from scipy.sparse.linalg import eigsh
-            H_sparse = csr_matrix(H_np)
-            eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-12)
-            fci_E = float(eigenvalues[0])
+            # Dense path for small systems — exact and fast
+            H_fci = self.matrix_elements(basis_tensor, basis_tensor)
+
+            # Convert to numpy with float64 for numerical stability
+            H_np = H_fci.cpu().numpy().astype(np.float64)
+
+            # Ensure Hermitian symmetry (critical for correct eigenvalues)
+            H_np = 0.5 * (H_np + H_np.T)
+
+            # Verify Hermiticity
+            asymmetry = np.abs(H_np - H_np.T).max()
+            if asymmetry > 1e-10:
+                print(f"WARNING: Hamiltonian asymmetry detected: {asymmetry:.2e}")
+
+            if n_configs <= 2000:
+                eigenvalues, _ = np.linalg.eigh(H_np)
+                fci_E = float(eigenvalues[0])
+            else:
+                from scipy.sparse import csr_matrix
+                from scipy.sparse.linalg import eigsh
+                H_sparse = csr_matrix(H_np)
+                eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-12)
+                fci_E = float(eigenvalues[0])
 
         elapsed = time.time() - start_time
         print(f"FCI energy: {fci_E:.8f} Ha (computed in {elapsed:.1f}s)")
+
+        # Save to cache
+        if _has_cache_meta:
+            try:
+                _cache_mod.save_fci_energy(
+                    self.integrals._geometry, self.integrals._basis,
+                    self.integrals._charge, self.integrals._spin,
+                    fci_E,
+                )
+                print(f"[HamiltonianCache] Saved FCI energy to disk cache")
+            except Exception as e:
+                print(f"[HamiltonianCache] Failed to save FCI energy: {e}")
 
         return fci_E
 
@@ -1586,19 +2163,55 @@ def compute_molecular_integrals(
     basis: str = "sto-3g",
     charge: int = 0,
     spin: int = 0,
+    use_cache: bool = True,
+    cas: Optional[Tuple[int, int]] = None,
+    casci: bool = False,
 ) -> MolecularIntegrals:
     """
-    Compute molecular integrals using PySCF.
+    Compute molecular integrals using PySCF, with optional disk caching.
 
     Args:
         geometry: List of (atom_symbol, (x, y, z)) tuples
         basis: Basis set name
         charge: Molecular charge
         spin: 2S (number of unpaired electrons)
+        use_cache: If True, check/store disk cache in ~/.cache/molecular-krylov/
+        cas: Optional (nelecas, ncas) tuple for CAS active space selection.
+            When provided, runs CASSCF (or CASCI if casci=True) after RHF
+            and returns integrals in the active space only (n_orbitals = ncas).
+        casci: If True and cas is not None, use CASCI instead of CASSCF.
+            CASCI uses HF MOs directly (no orbital optimization), which is
+            faster for large active spaces where CASSCF's iterative FCI solver
+            is prohibitively expensive (e.g., CAS(10,15)+ with 9M+ configs).
 
     Returns:
         MolecularIntegrals object
     """
+    try:
+        from utils.hamiltonian_cache import load_integrals, save_integrals
+    except ImportError:
+        from src.utils.hamiltonian_cache import load_integrals, save_integrals
+
+    # Try loading from cache first (skip cache for CAS — CASSCF optimization is not cached)
+    if use_cache and cas is None:
+        cached = load_integrals(geometry, basis, charge, spin)
+        if cached is not None:
+            print(f"[HamiltonianCache] Loaded integrals from disk cache")
+            result = MolecularIntegrals(
+                h1e=cached["h1e"],
+                h2e=cached["h2e"],
+                nuclear_repulsion=cached["nuclear_repulsion"],
+                n_electrons=cached["n_electrons"],
+                n_orbitals=cached["n_orbitals"],
+                n_alpha=cached["n_alpha"],
+                n_beta=cached["n_beta"],
+            )
+            result._geometry = list(geometry)
+            result._basis = basis
+            result._charge = charge
+            result._spin = spin
+            return result
+
     try:
         from pyscf import gto, scf, ao2mo
     except ImportError:
@@ -1610,6 +2223,10 @@ def compute_molecular_integrals(
     mol.basis = basis
     mol.charge = charge
     mol.spin = spin
+    # Enable symmetry to resolve degenerate orbital rotations (e.g., N2 pi orbitals).
+    # PySCF uses Abelian subgroups (D2h etc.) which split degenerate irreps,
+    # making MO coefficients deterministic across SCF runs.
+    mol.symmetry = True
     mol.build()
 
     # Run HF to get orbitals
@@ -1619,6 +2236,93 @@ def compute_molecular_integrals(
         mf = scf.ROHF(mol)
     mf.kernel()
 
+    # CAS active space path
+    if cas is not None:
+        from pyscf import mcscf, fci
+
+        nelecas, ncas = cas
+
+        if casci:
+            # CASCI: no orbital optimization, uses HF MOs directly.
+            # Much faster for large active spaces where CASSCF's iterative
+            # FCI solver is prohibitively expensive (e.g., CAS(10,15)+).
+            mc = mcscf.CASCI(mf, ncas=ncas, nelecas=nelecas)
+        else:
+            mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
+
+        # Linear molecules (D∞h/C∞v) with symmetry=True can cause
+        # PointGroupSymmetryError when CAS orbital selection breaks
+        # an E-irrep pair. Use the non-symmetry FCI solver to avoid this.
+        if mol.symmetry and mol.topgroup in ('Dooh', 'Coov'):
+            mc.fcisolver = fci.direct_spin1.FCISolver(mol)
+
+        # Compute config space size to decide if FCI is feasible.
+        # For CASCI with >50M configs (e.g., CAS(10,20) = 240M), PySCF's
+        # FCI solver is infeasible — skip kernel() and extract integrals only.
+        from math import comb as _comb
+
+        if isinstance(nelecas, (tuple, list)):
+            _na, _nb = nelecas[0], nelecas[1]
+        else:
+            _na = (nelecas + spin) // 2
+            _nb = (nelecas - spin) // 2
+        _n_configs = _comb(ncas, _na) * _comb(ncas, _nb)
+        _FCI_CONFIG_LIMIT = 50_000_000  # 50M configs
+
+        if casci and _n_configs > _FCI_CONFIG_LIMIT:
+            # Integrals-only mode: h1e_for_cas() and ao2mo work without
+            # kernel() because CASCI sets mo_coeff = mf.mo_coeff at __init__.
+            print(
+                f"[CAS] Skipping FCI solve for CAS({nelecas},{ncas}): "
+                f"{_n_configs:,} configs > {_FCI_CONFIG_LIMIT:,} limit. "
+                f"Extracting integrals only."
+            )
+        else:
+            mc.kernel()
+
+            if not casci and not mc.converged:
+                import warnings
+                warnings.warn(
+                    f"CASSCF did not converge for CAS({nelecas},{ncas}). "
+                    "Integrals may be unreliable."
+                )
+
+        # h1e_for_cas returns (h1e_cas, e_core)
+        # e_core = nuclear_repulsion + frozen core energy
+        h1e_cas, e_core = mc.h1e_for_cas()
+
+        # Two-electron integrals in active MO basis
+        active_mo = mc.mo_coeff[:, mc.ncore:mc.ncore + mc.ncas]
+        h2e_cas = ao2mo.full(mol, active_mo)
+        h2e_cas = ao2mo.restore(1, h2e_cas, ncas)
+
+        h1e_cas = np.asarray(h1e_cas, dtype=np.float64)
+        h2e_cas = np.asarray(h2e_cas, dtype=np.float64)
+
+        # Active electron counts
+        if isinstance(nelecas, (tuple, list)):
+            n_alpha_cas = nelecas[0]
+            n_beta_cas = nelecas[1]
+            n_elec_cas = sum(nelecas)
+        else:
+            n_elec_cas = nelecas
+            n_alpha_cas = (nelecas + spin) // 2
+            n_beta_cas = (nelecas - spin) // 2
+
+        # Do NOT set _geometry/_basis/_charge/_spin metadata — CAS integrals
+        # depend on CASSCF orbital optimization which is non-deterministic,
+        # so disk caching would be unsafe.
+        return MolecularIntegrals(
+            h1e=h1e_cas,
+            h2e=h2e_cas,
+            nuclear_repulsion=float(e_core),
+            n_electrons=n_elec_cas,
+            n_orbitals=ncas,
+            n_alpha=n_alpha_cas,
+            n_beta=n_beta_cas,
+        )
+
+    # Full (non-CAS) integral computation
     # Get integrals in MO basis
     h1e = mf.mo_coeff.T @ mf.get_hcore() @ mf.mo_coeff
 
@@ -1631,19 +2335,39 @@ def compute_molecular_integrals(
     n_alpha = (n_electrons + spin) // 2
     n_beta = (n_electrons - spin) // 2
 
-    return MolecularIntegrals(
+    nuclear_repulsion = mol.energy_nuc()
+
+    # Save to cache
+    if use_cache:
+        try:
+            mol_hash = save_integrals(
+                geometry, basis, charge, spin,
+                h1e, h2e, nuclear_repulsion,
+                n_electrons, n_orbitals, n_alpha, n_beta,
+            )
+            print(f"[HamiltonianCache] Saved integrals to disk cache ({mol_hash})")
+        except Exception as e:
+            print(f"[HamiltonianCache] Failed to save integrals: {e}")
+
+    result = MolecularIntegrals(
         h1e=h1e,
         h2e=h2e,
-        nuclear_repulsion=mol.energy_nuc(),
+        nuclear_repulsion=nuclear_repulsion,
         n_electrons=n_electrons,
         n_orbitals=n_orbitals,
         n_alpha=n_alpha,
         n_beta=n_beta,
     )
+    result._geometry = list(geometry)
+    result._basis = basis
+    result._charge = charge
+    result._spin = spin
+    return result
 
 
 def create_h2_hamiltonian(
     bond_length: float = 0.74,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """Create H2 Hamiltonian at given bond length."""
@@ -1651,12 +2375,13 @@ def create_h2_hamiltonian(
         ("H", (0.0, 0.0, 0.0)),
         ("H", (0.0, 0.0, bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_lih_hamiltonian(
     bond_length: float = 1.6,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """Create LiH Hamiltonian at given bond length."""
@@ -1664,13 +2389,14 @@ def create_lih_hamiltonian(
         ("Li", (0.0, 0.0, 0.0)),
         ("H", (0.0, 0.0, bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_h2o_hamiltonian(
     oh_length: float = 0.96,
     angle: float = 104.5,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """Create H2O Hamiltonian."""
@@ -1680,12 +2406,13 @@ def create_h2o_hamiltonian(
         ("H", (oh_length, 0.0, 0.0)),
         ("H", (oh_length * np.cos(angle_rad), oh_length * np.sin(angle_rad), 0.0)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_beh2_hamiltonian(
     bond_length: float = 1.33,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """
@@ -1700,13 +2427,14 @@ def create_beh2_hamiltonian(
         ("H", (0.0, 0.0, bond_length)),
         ("H", (0.0, 0.0, -bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_nh3_hamiltonian(
     nh_length: float = 1.01,
     hnh_angle: float = 107.8,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """
@@ -1728,12 +2456,13 @@ def create_nh3_hamiltonian(
         ("H", (r * np.cos(np.radians(120)), r * np.sin(np.radians(120)), 0.0)),
         ("H", (r * np.cos(np.radians(240)), r * np.sin(np.radians(240)), 0.0)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_n2_hamiltonian(
     bond_length: float = 1.10,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """
@@ -1749,12 +2478,13 @@ def create_n2_hamiltonian(
         ("N", (0.0, 0.0, 0.0)),
         ("N", (0.0, 0.0, bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
     return MolecularHamiltonian(integrals, device=device)
 
 
 def create_ch4_hamiltonian(
     ch_length: float = 1.09,
+    basis: str = "sto-3g",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
 ) -> MolecularHamiltonian:
     """
@@ -1775,5 +2505,220 @@ def create_ch4_hamiltonian(
         ("H", (-a, a, -a)),
         ("H", (-a, -a, a)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis="sto-3g")
+    integrals = compute_molecular_integrals(geometry, basis=basis)
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_n2_cas_hamiltonian(
+    bond_length: float = 1.10,
+    basis: str = "cc-pvdz",
+    cas: Tuple[int, int] = (10, 8),
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create N2 Hamiltonian with CAS (Complete Active Space) reduction.
+
+    Runs CASSCF to select active orbitals, then returns a Hamiltonian
+    over the CAS active space only.
+
+    Default: CAS(10, 8) on cc-pVDZ gives 8 active orbitals and
+    C(8,5)² = 3,136 configurations — small enough for exact FCI.
+
+    Args:
+        bond_length: N-N distance in Angstroms
+        basis: Basis set name (default: cc-pvdz)
+        cas: (nelecas, ncas) tuple for active space selection
+        device: Computation device
+
+    Returns:
+        MolecularHamiltonian over the CAS active space
+    """
+    geometry = [
+        ("N", (0.0, 0.0, 0.0)),
+        ("N", (0.0, 0.0, bond_length)),
+    ]
+    # CASCI fallback for large active spaces where CASSCF's internal FCI
+    # is too slow (e.g., CAS(10,15) has C(15,5)^2 = 9M+ configs).
+    nelecas, ncas = cas
+    use_casci = ncas >= 15
+    integrals = compute_molecular_integrals(
+        geometry, basis=basis, cas=cas, casci=use_casci
+    )
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_cr2_hamiltonian(
+    bond_length: float = 1.68,
+    basis: str = "sto-3g",
+    cas: Optional[Tuple[int, int]] = (12, 12),
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create Cr2 (chromium dimer) Hamiltonian.
+
+    Cr2 has a formal sextuple bond and is one of the most challenging
+    multi-reference systems in quantum chemistry. The 3d electrons on
+    each Cr atom create strong static correlation.
+
+    Default: CAS(12,12) on STO-3G gives 12 active orbitals (3d + 4s)
+    and C(12,6)^2 = 853,776 configurations -- 24 qubits.
+
+    Args:
+        bond_length: Cr-Cr distance in Angstroms (equilibrium ~1.68 A)
+        basis: Basis set (default: sto-3g for method development)
+        cas: (nelecas, ncas) for active space. None = full space.
+        device: Computation device
+
+    Notes:
+        - SCF convergence can be difficult for Cr2; uses max_cycle=300.
+        - CASSCF uses ``fix_spin_(ss=0)`` to target the singlet ground state.
+          Without this constraint, CASSCF converges to the septet (S=3)
+          state which is variationally lower but physically incorrect for
+          the ground-state singlet with sextuple bond character.
+        - CAS(12,12) captures 3d-3d metal bonding (6 electrons from each Cr:
+          3d^5 + 4s^1 = 6 active electrons per atom, 12 total).
+        - Cr2 is a classic benchmark for multi-reference methods due to
+          strong static correlation from the near-degenerate 3d orbitals.
+    """
+    if cas is None:
+        # Full-space (no CAS) -- delegate to compute_molecular_integrals
+        geometry = [
+            ("Cr", (0.0, 0.0, 0.0)),
+            ("Cr", (0.0, 0.0, bond_length)),
+        ]
+        integrals = compute_molecular_integrals(geometry, basis=basis)
+        return MolecularHamiltonian(integrals, device=device)
+
+    # CAS path: custom CASSCF with fix_spin_ to target singlet ground state
+    try:
+        from pyscf import gto, scf, mcscf, fci, ao2mo
+    except ImportError:
+        raise ImportError("PySCF is required for Cr2 Hamiltonian")
+
+    import warnings
+
+    mol = gto.M(
+        atom=f"Cr 0 0 0; Cr 0 0 {bond_length}",
+        basis=basis,
+        spin=0,
+        symmetry=True,
+        verbose=0,
+    )
+
+    mf = scf.RHF(mol)
+    mf.max_cycle = 300
+    mf.kernel()
+
+    if not mf.converged:
+        warnings.warn(
+            f"RHF did not converge for Cr2 (bond_length={bond_length}, basis={basis}). "
+            "Trying ROHF fallback."
+        )
+        mf = scf.ROHF(mol)
+        mf.max_cycle = 300
+        mf.kernel()
+        if not mf.converged:
+            warnings.warn("ROHF also did not converge for Cr2. Results may be unreliable.")
+
+    nelecas, ncas = cas
+
+    mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
+
+    # Linear molecules (D_inf_h / C_inf_v) need non-symmetry FCI solver
+    if mol.symmetry and mol.topgroup in ("Dooh", "Coov"):
+        mc.fcisolver = fci.direct_spin1.FCISolver(mol)
+
+    # Cr2 CASSCF without spin constraint converges to septet (S=3, S^2=12)
+    # instead of the singlet ground state. fix_spin_ adds a penalty to
+    # enforce <S^2> = 0 (singlet).
+    mc.fix_spin_(ss=0)
+    mc.kernel()
+
+    if not mc.converged:
+        warnings.warn(
+            f"CASSCF did not converge for Cr2 CAS({nelecas},{ncas}). "
+            "Integrals may be unreliable."
+        )
+
+    # Extract active-space integrals
+    h1e_cas, e_core = mc.h1e_for_cas()
+    active_mo = mc.mo_coeff[:, mc.ncore : mc.ncore + mc.ncas]
+    h2e_cas = ao2mo.full(mol, active_mo)
+    h2e_cas = ao2mo.restore(1, h2e_cas, ncas)
+
+    h1e_cas = np.asarray(h1e_cas, dtype=np.float64)
+    h2e_cas = np.asarray(h2e_cas, dtype=np.float64)
+
+    # Active electron counts
+    if isinstance(nelecas, (tuple, list)):
+        n_alpha_cas = nelecas[0]
+        n_beta_cas = nelecas[1]
+        n_elec_cas = sum(nelecas)
+    else:
+        n_elec_cas = nelecas
+        n_alpha_cas = nelecas // 2
+        n_beta_cas = nelecas // 2
+
+    integrals = MolecularIntegrals(
+        h1e=h1e_cas,
+        h2e=h2e_cas,
+        nuclear_repulsion=float(e_core),
+        n_electrons=n_elec_cas,
+        n_orbitals=ncas,
+        n_alpha=n_alpha_cas,
+        n_beta=n_beta_cas,
+    )
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_benzene_hamiltonian(
+    basis: str = "sto-3g",
+    cas: Optional[Tuple[int, int]] = (6, 15),
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create benzene (C6H6) Hamiltonian with CAS active space reduction.
+
+    Benzene in D6h geometry (regular hexagon). Default active space is
+    CAS(6,15) = 6 pi electrons in 15 orbitals (pi + sigma correlation).
+    C(15,3)^2 = 455^2 = 207,025 configurations = 30 qubits.
+
+    For CAS with ncas >= 15, automatically uses CASCI (no orbital
+    optimization) since CASSCF's iterative FCI solver is prohibitively
+    expensive at that scale.
+
+    Args:
+        basis: Basis set name (default: sto-3g)
+        cas: Optional (nelecas, ncas) for active space. Default: (6, 15).
+            Set to None for full-space (not recommended: 42e, 36o in STO-3G).
+        device: Computation device
+
+    Returns:
+        MolecularHamiltonian over the CAS active space (or full space)
+    """
+    import math as _math
+
+    # Regular hexagon: R(C-C) = 1.40 A, R(C-H) = 1.08 A
+    cc_dist = 1.40
+    ch_dist = 1.08
+
+    geometry = []
+    for i in range(6):
+        angle = _math.pi / 3 * i
+        cx = cc_dist * _math.cos(angle)
+        cy = cc_dist * _math.sin(angle)
+        geometry.append(("C", (cx, cy, 0.0)))
+        hx = (cc_dist + ch_dist) * _math.cos(angle)
+        hy = (cc_dist + ch_dist) * _math.sin(angle)
+        geometry.append(("H", (hx, hy, 0.0)))
+
+    # CASCI fallback for large active spaces
+    use_casci = False
+    if cas is not None:
+        _, ncas = cas
+        use_casci = ncas >= 15
+
+    integrals = compute_molecular_integrals(
+        geometry, basis=basis, cas=cas, casci=use_casci
+    )
     return MolecularHamiltonian(integrals, device=device)

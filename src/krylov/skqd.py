@@ -41,10 +41,10 @@ except ImportError:
 # Support both package imports and direct script execution
 try:
     from ..hamiltonians.base import Hamiltonian
-    from ..utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply
+    from ..utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply, mixed_precision_eigh
 except ImportError:
     from hamiltonians.base import Hamiltonian
-    from utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply
+    from utils.gpu_linalg import gpu_eigh, gpu_eigsh, gpu_expm_multiply, mixed_precision_eigh
 
 
 @dataclass
@@ -86,6 +86,18 @@ class SKQDConfig:
     # are used for diagonalization. Set to 0 to disable (no cap).
     max_diag_basis_size: int = 15000
 
+    # === ADAPTIVE CONVERGENCE (PR-A2) ===
+    # Energy convergence threshold (Hartree). If |E_k - E_{k-1}| < threshold,
+    # early-stop the Krylov expansion. Set to 0 to disable early stopping.
+    # Recommended: 1e-5 (0.01 mHa) when enabling convergence-based early stop.
+    convergence_threshold: float = 1e-5
+
+    # Adaptive time step scaling. When True, dt is clamped to pi/spectral_range
+    # to prevent aliasing when the Hamiltonian has wide eigenvalue spread.
+    # Default False to preserve backward compatibility. Enable for large systems
+    # (40Q+) where spectral range can cause aliasing with fixed dt.
+    adaptive_dt: bool = False
+
 
 class SampleBasedKrylovDiagonalization:
     """
@@ -103,6 +115,12 @@ class SampleBasedKrylovDiagonalization:
         config: SKQD configuration
         initial_state: Optional initial state (default: HF state)
     """
+
+    # Guard: systems larger than this skip full subspace enumeration
+    # to prevent OOM. Dense complex128 matrix is n² × 16 bytes:
+    #   15000² = 3.6 GB, 20000² = 6.4 GB, 63504² = 64.5 GB
+    # Keep aligned with FlowGuidedSKQD.MAX_FULL_SUBSPACE_SIZE.
+    MAX_FULL_SUBSPACE_SIZE = 15000
 
     def __init__(
         self,
@@ -156,6 +174,13 @@ class SampleBasedKrylovDiagonalization:
         n_valid = comb(n_orb, n_alpha) * comb(n_orb, n_beta)
         print(f"Setting up particle-conserving subspace: {n_valid:,} configs "
               f"(vs {self.hamiltonian.hilbert_dim:,} full Hilbert space)")
+
+        if n_valid > self.MAX_FULL_SUBSPACE_SIZE:
+            print(f"WARNING: {n_valid:,} configs exceeds MAX_FULL_SUBSPACE_SIZE "
+                  f"({self.MAX_FULL_SUBSPACE_SIZE:,}). Skipping full subspace enumeration.")
+            self._subspace_basis = None
+            self._subspace_index_map = None
+            return
 
         # Generate all valid configurations
         alpha_configs = list(combinations(range(n_orb), n_alpha))
@@ -521,7 +546,8 @@ class SampleBasedKrylovDiagonalization:
 
     def _bitstring_to_tensor(self, bitstring: str) -> torch.Tensor:
         """Convert bitstring to tensor configuration."""
-        return torch.tensor([int(b) for b in bitstring], dtype=torch.long)
+        return torch.tensor([int(b) for b in bitstring], dtype=torch.long,
+                            device=self.hamiltonian.device)
 
     def generate_krylov_samples(
         self,
@@ -653,7 +679,7 @@ class SampleBasedKrylovDiagonalization:
         max_multinomial_categories = 2**24
         if n_subspace <= max_multinomial_categories and torch.cuda.is_available():
             # Use CUDA for sampling (faster)
-            probs_torch = torch.from_numpy(probs).float().cuda()
+            probs_torch = torch.from_numpy(probs).double().cuda()
             indices = torch.multinomial(
                 probs_torch, num_samples, replacement=True
             ).cpu().numpy()
@@ -726,6 +752,8 @@ class SampleBasedKrylovDiagonalization:
         basis: Optional[torch.Tensor] = None,
         return_eigenvector: bool = False,
         regularization: float = 1e-8,
+        shift_invert: bool = False,
+        mixed_precision: bool = False,
     ) -> Tuple[float, Optional[torch.Tensor]]:
         """
         Compute ground state energy via subspace diagonalization.
@@ -745,6 +773,8 @@ class SampleBasedKrylovDiagonalization:
             basis: Basis states to use (default: use all sampled states)
             return_eigenvector: Whether to return ground state coefficients
             regularization: Small value added to diagonal for stability
+            mixed_precision: If True, use FP32 eigh + FP64 Rayleigh refinement
+                for ~100x speedup on DGX Spark GB10 (TF32 vs FP64)
 
         Returns:
             (ground_energy, ground_state_coefficients) if return_eigenvector
@@ -758,16 +788,36 @@ class SampleBasedKrylovDiagonalization:
         # Cap basis size to avoid building huge dense matrices (N^2 memory)
         max_diag = self.config.max_diag_basis_size
         if max_diag > 0 and len(basis) > max_diag:
-            # Keep first max_diag configs — pipeline orders by importance:
-            # essential configs (HF+singles+doubles) first, then PT2-ranked residual
             original_size = len(basis)
-            basis = basis[:max_diag]
-            print(f"  Capped basis from {original_size} to {max_diag} configs for diagonalization")
+            basis = self._rank_and_truncate_basis(basis, max_diag)
+            print(f"  Capped basis from {original_size} to {max_diag} configs "
+                  f"(importance-ranked by diagonal energy)")
 
-        # Build projected Hamiltonian (stays on GPU)
+        n = len(basis)
+        device = basis.device
+
+        # Memory logging
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from src.utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+
+        # Use sparse path for large bases to avoid O(n²) dense matrix
+        SPARSE_THRESHOLD = 3000
+        if n >= SPARSE_THRESHOLD and hasattr(self.hamiltonian, 'get_sparse_matrix_elements'):
+            if log_allocation:
+                log_allocation("compute_ground_state_energy", n, layout="sparse")
+            return self._sparse_ground_state(
+                basis, return_eigenvector, regularization, shift_invert=shift_invert
+            )
+
+        # Dense path: build projected Hamiltonian
+        if log_allocation:
+            log_allocation("compute_ground_state_energy", n, dtype="float64", layout="dense")
         H_proj = self.hamiltonian.matrix_elements(basis, basis)
-        n = H_proj.shape[0]
-        device = H_proj.device
 
         # Use float64 for numerical stability (GPU supports double precision)
         H = H_proj.detach().double()
@@ -784,32 +834,47 @@ class SampleBasedKrylovDiagonalization:
             H = 0.5 * (H + H.T)
 
         # Add small regularization to improve conditioning
-        # NOTE: This shifts ALL eigenvalues up by regularization amount
+        # This shifts ALL eigenvalues up by regularization — subtracted after eigsolve
         if regularization > 0:
-            H = H + regularization * torch.eye(n, dtype=H.dtype, device=device)
+            H = H + regularization * torch.eye(n, dtype=H.dtype, device=H.device)
+            energy_shift = regularization
+        else:
+            energy_shift = 0.0
 
-        # Check matrix conditioning (on GPU)
+        # Check matrix conditioning
         try:
             # Use torch.linalg.cond for GPU-accelerated condition number
             cond = torch.linalg.cond(H).item()
             if cond > 1e12:
                 print(f"WARNING: Ill-conditioned Hamiltonian (cond={cond:.2e})")
                 print("Using SVD-based solver for numerical stability")
-                return self._svd_ground_state(H, return_eigenvector)
-        except Exception:
-            print("WARNING: Could not compute condition number, using SVD")
-            return self._svd_ground_state(H, return_eigenvector)
+                self._last_ill_conditioned = True
+                E0, v0 = self._svd_ground_state(H, return_eigenvector)
+                return E0 - energy_shift, v0
+        except (RuntimeError, ValueError) as e:
+            if "out of memory" in str(e).lower():
+                raise
+            print(f"WARNING: Could not compute condition number ({e}), using SVD")
+            E0, v0 = self._svd_ground_state(H, return_eigenvector)
+            return E0 - energy_shift, v0
 
         # GPU-accelerated eigensolver — stays entirely on GPU
         # gpu_eigsh uses dense torch.linalg.eigh for n <= 10000, CuPy sparse for larger
+        use_gpu = device.type == 'cuda'
         try:
-            if n >= 2:
+            if mixed_precision:
+                # FP32 eigh + FP64 Rayleigh quotient refinement
+                # ~100x speedup on DGX Spark GB10 (TF32 vs FP64)
+                eigenvalues, eigenvectors = mixed_precision_eigh(H, use_gpu=use_gpu)
+                E0 = float(eigenvalues[0].cpu())
+                v0 = eigenvectors[:, 0] if return_eigenvector else None
+            elif n >= 2:
                 k_eig = min(2, n - 1)
-                eigenvalues, eigenvectors = gpu_eigsh(H, k=k_eig, which='SA', use_gpu=True)
+                eigenvalues, eigenvectors = gpu_eigsh(H, k=k_eig, which='SA', use_gpu=use_gpu)
                 E0 = float(eigenvalues[0].cpu())
                 v0 = eigenvectors[:, 0] if return_eigenvector else None
             else:
-                eigenvalues, eigenvectors = gpu_eigh(H, use_gpu=True)
+                eigenvalues, eigenvectors = gpu_eigh(H, use_gpu=use_gpu)
                 E0 = float(eigenvalues[0].cpu())
                 v0 = eigenvectors[:, 0] if return_eigenvector else None
         except Exception as e:
@@ -818,6 +883,9 @@ class SampleBasedKrylovDiagonalization:
             eigenvalues, eigenvectors = np.linalg.eigh(H_np)
             E0 = float(eigenvalues[0])
             v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
+
+        # Subtract regularization shift to recover true eigenvalue
+        E0 -= energy_shift
 
         if return_eigenvector:
             return E0, v0
@@ -875,6 +943,119 @@ class SampleBasedKrylovDiagonalization:
         else:
             return E0, None
 
+    def _rank_and_truncate_basis(
+        self,
+        basis: torch.Tensor,
+        max_size: int,
+    ) -> torch.Tensor:
+        """
+        Rank basis configs by diagonal energy and keep the lowest-energy ones.
+
+        Essential configs (HF + singles + doubles, i.e. excitation rank <= 2)
+        are always preserved regardless of their diagonal energy.
+
+        Args:
+            basis: (n_basis, n_sites) configuration tensor
+            max_size: Maximum number of configs to keep
+
+        Returns:
+            Truncated basis tensor of shape (max_size, n_sites)
+        """
+        n = len(basis)
+        if n <= max_size:
+            return basis
+
+        # Compute diagonal energies in batch (vectorized, FP64)
+        diag_energies = self.hamiltonian.diagonal_elements_batch(basis)
+
+        # Identify essential configs: excitation rank <= 2 from HF
+        hf = self.hamiltonian.get_hf_state().to(basis.device)
+        # Excitation rank = number of orbitals that differ from HF / 2
+        diffs = (basis != hf.unsqueeze(0)).sum(dim=1)  # changed orbital count
+        excitation_rank = diffs // 2  # each excitation changes 2 orbitals
+        essential_mask = excitation_rank <= 2
+
+        n_essential = essential_mask.sum().item()
+
+        if n_essential >= max_size:
+            # More essential configs than max_size — rank essentials by energy
+            essential_energies = diag_energies.clone()
+            essential_energies[~essential_mask] = float('inf')
+            _, indices = torch.sort(essential_energies)
+            return basis[indices[:max_size]]
+
+        # Protect essential configs by giving them -inf energy (always selected)
+        sort_energies = diag_energies.clone()
+        sort_energies[essential_mask] = float('-inf')
+
+        # Sort: -inf essentials come first, then by ascending energy
+        _, indices = torch.sort(sort_energies)
+        return basis[indices[:max_size]]
+
+    def _sparse_ground_state(
+        self,
+        basis: torch.Tensor,
+        return_eigenvector: bool = False,
+        regularization: float = 0.0,
+        shift_invert: bool = False,
+    ) -> Tuple[float, Optional[torch.Tensor]]:
+        """
+        Compute ground state using sparse Hamiltonian construction + scipy.sparse.eigsh.
+
+        Avoids O(n^2) dense matrix construction for large bases.
+        Delegates to sparse_hamiltonian_eigsh() for build + solve.
+
+        Args:
+            shift_invert: If True, use shift-invert mode with sigma=E_hf.
+                This finds eigenvalues near sigma via (H - sigma*I)^{-1},
+                converging faster when sigma is close to the ground state.
+        """
+        n = len(basis)
+        device = basis.device
+        mode_str = "shift-invert" if shift_invert else "standard"
+        print(f"  Using sparse eigensolver ({mode_str}) for {n} configs")
+
+        try:
+            try:
+                from utils.gpu_linalg import sparse_hamiltonian_eigsh
+            except ImportError:
+                from src.utils.gpu_linalg import sparse_hamiltonian_eigsh
+
+            eigenvalues, eigenvectors = sparse_hamiltonian_eigsh(
+                self.hamiltonian, basis, k=2, which='SA',
+                shift_invert=shift_invert,
+            )
+            E0 = float(eigenvalues[0].cpu())
+            v0 = eigenvectors[:, 0] if return_eigenvector else None
+        except Exception as e:
+            # For large bases, do NOT fall back to dense — it would cause OOM.
+            # The SPARSE_THRESHOLD (3000) that routes here means n >= 3000.
+            # Dense fallback is only acceptable for bases that accidentally
+            # ended up here but are still small enough for dense.
+            SAFE_DENSE_LIMIT = 5000
+            if n > SAFE_DENSE_LIMIT:
+                raise RuntimeError(
+                    f"Sparse eigsh failed for {n} configs ({e}). "
+                    f"Dense fallback refused (would allocate {n**2 * 8 / 1e9:.1f} GB). "
+                    f"Fix the sparse eigensolver or reduce basis size."
+                ) from e
+            print(f"  Sparse eigsh failed ({e}), falling back to dense (n={n} <= {SAFE_DENSE_LIMIT})")
+            H_proj = self.hamiltonian.matrix_elements(basis, basis)
+            H_np = H_proj.cpu().numpy().astype(np.float64)
+            H_np = 0.5 * (H_np + H_np.T)
+            if regularization > 0:
+                H_np += regularization * np.eye(n)
+            eigenvalues, eigenvectors = np.linalg.eigh(H_np)
+            E0 = float(eigenvalues[0])
+            if regularization > 0:
+                E0 -= regularization
+            v0 = torch.from_numpy(eigenvectors[:, 0]).to(device) if return_eigenvector else None
+
+        if return_eigenvector:
+            return E0, v0
+        else:
+            return E0, None
+
     def run(
         self,
         max_krylov_dim: Optional[int] = None,
@@ -894,6 +1075,12 @@ class SampleBasedKrylovDiagonalization:
         """
         if max_krylov_dim is None:
             max_krylov_dim = self.config.max_krylov_dim
+
+        if max_krylov_dim < 2:
+            raise ValueError(
+                f"max_krylov_dim must be >= 2, got {max_krylov_dim}. "
+                f"The Krylov loop requires at least 2 dimensions to produce results."
+            )
 
         # Generate Krylov samples
         self.generate_krylov_samples(max_krylov_dim, progress=progress)
@@ -933,13 +1120,15 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
     the energy estimate through systematic subspace expansion.
 
     OPTIMIZATION FOR LARGE SYSTEMS:
-    For systems with >100k valid configurations, we use NF-basis-guided
+    For systems with >15k valid configurations, we use NF-basis-guided
     Krylov expansion instead of full particle-conserving subspace evolution.
-    This avoids building the prohibitively large Hamiltonian matrix.
+    This avoids building the prohibitively large dense Hamiltonian matrix
+    (n² × 16 bytes for complex128: 15000² = 3.6 GB, 63504² = 64.5 GB).
     """
 
     # Threshold for using NF-guided Krylov (vs full subspace evolution)
-    MAX_FULL_SUBSPACE_SIZE = 100000
+    # Must match SampleBasedKrylovDiagonalization.MAX_FULL_SUBSPACE_SIZE.
+    MAX_FULL_SUBSPACE_SIZE = 15000
 
     def __init__(
         self,
@@ -988,6 +1177,59 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             super().__init__(hamiltonian, config, initial_state)
 
         self.nf_basis = nf_basis  # (n_nf, num_sites)
+
+    def _nnci_expand_basis(
+        self,
+        basis: torch.Tensor,
+        nnci_iterations: int = 5,
+        nnci_candidates_per_iter: int = 5000,
+    ) -> torch.Tensor:
+        """
+        Expand basis using NNCI (Neural Network Configuration Interaction).
+
+        Trains a feedforward NN classifier on CI coefficients to discover
+        important higher-excitation configurations (triples, quadruples, etc.)
+        beyond the initial CISD basis.
+
+        Args:
+            basis: Initial basis tensor (n_configs, n_sites)
+            nnci_iterations: Number of active learning iterations
+            nnci_candidates_per_iter: Max candidates to generate per iteration
+
+        Returns:
+            Expanded basis tensor with NNCI-discovered configs appended
+        """
+        try:
+            from ..krylov.nnci import NNCIConfig, NNCIActiveLearning
+        except ImportError:
+            from krylov.nnci import NNCIConfig, NNCIActiveLearning
+
+        nnci_config = NNCIConfig(
+            max_iterations=nnci_iterations,
+            top_k=min(50, nnci_candidates_per_iter),
+            max_candidates=nnci_candidates_per_iter,
+            max_excitation_rank=4,
+            training_epochs=100,
+            convergence_threshold=1e-6,
+        )
+
+        print(f"NNCI expansion: {nnci_iterations} iterations, "
+              f"up to {nnci_candidates_per_iter} candidates/iter")
+
+        nnci = NNCIActiveLearning(
+            hamiltonian=self.hamiltonian,
+            initial_basis=basis,
+            config=nnci_config,
+        )
+
+        results = nnci.run()
+
+        expanded_basis = results["final_basis"]
+        n_added = len(expanded_basis) - len(basis)
+        print(f"NNCI added {n_added} configs "
+              f"(basis: {len(basis)} -> {len(expanded_basis)})")
+
+        return expanded_basis
 
     def get_combined_basis(
         self,
@@ -1047,12 +1289,31 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         """
         device = self.hamiltonian.device if hasattr(self.hamiltonian, 'device') else 'cpu'
 
+        # Cache MP2 t2 amplitudes for importance-ranked config discovery
+        self._mp2_t2 = None
+        if hasattr(self.hamiltonian, 'integrals') and hasattr(self.hamiltonian, 'n_alpha'):
+            if self.hamiltonian.n_alpha == getattr(self.hamiltonian, 'n_beta', None):
+                try:
+                    try:
+                        from utils.perturbative_pruning import compute_mp2_amplitudes
+                    except ImportError:
+                        from ..utils.perturbative_pruning import compute_mp2_amplitudes
+                    self._mp2_t2, e_mp2 = compute_mp2_amplitudes(self.hamiltonian)
+                    print(f"  MP2 pruning enabled (E_MP2_corr = {e_mp2:.6f} Ha)")
+                except Exception as e:
+                    print(f"  MP2 pruning unavailable: {e}")
+
         # Start with NF basis as the subspace
         current_basis = self.nf_basis.clone().to(device)
         n_initial = len(current_basis)
+        n_sites = current_basis.shape[1]
 
-        # Create index mapping
-        basis_set = {tuple(c.cpu().tolist()) for c in current_basis}
+        # Create index mapping using overflow-safe integer encoding
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
+        basis_set = set(config_integer_hash(current_basis))
 
         # Cap total expansion to max_diag_basis_size to avoid huge matrix builds
         max_expansion = self.config.max_diag_basis_size
@@ -1087,8 +1348,8 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                     # Basis is frozen — reuse cached H to avoid expensive rebuild
                     if H_subspace_cached is None:
                         H_subspace_cached = self._build_hamiltonian_in_basis_gpu(current_basis)
-                    # GPU time evolution via gpu_expm_multiply
-                    psi = gpu_expm_multiply(H_subspace_cached, psi, t=-1j * self.time_step)
+                    # Time evolution (scipy sparse or GPU dense)
+                    psi = self._expm_multiply_step(H_subspace_cached, psi, self.time_step)
                     psi = psi / torch.linalg.norm(psi)
                     continue
 
@@ -1104,20 +1365,19 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                         new_configs = new_configs[:room]
 
                 if len(new_configs) > 0:
-                    # Add new configs to basis
+                    # Add new configs to basis (overflow-safe integer encoding)
                     current_basis = torch.cat([current_basis, new_configs], dim=0)
-                    for c in new_configs:
-                        basis_set.add(tuple(c.cpu().tolist()))
+                    basis_set.update(config_integer_hash(new_configs))
 
                     # Expand state vector on GPU (new configs start with zero amplitude)
                     n_new = len(new_configs)
                     psi = torch.cat([psi, torch.zeros(n_new, dtype=torch.complex128, device=device)])
 
-                # Build Hamiltonian in current subspace (GPU dense tensor)
+                # Build Hamiltonian in current subspace (dense torch or sparse CSR)
                 H_subspace = self._build_hamiltonian_in_basis_gpu(current_basis)
 
-                # GPU time evolution
-                psi = gpu_expm_multiply(H_subspace, psi, t=-1j * self.time_step)
+                # Time evolution (scipy sparse or GPU dense)
+                psi = self._expm_multiply_step(H_subspace, psi, self.time_step)
 
                 # Normalize on GPU
                 psi = psi / torch.linalg.norm(psi)
@@ -1140,7 +1400,8 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         Find configurations connected to current basis but not in it.
 
         Uses configurable sampling parameters for better discovery rate.
-        Default discovery rate was ~7% (296/4144), target is >20%.
+        When MP2 t2 amplitudes are cached (via _mp2_t2), ranks discovered
+        configs by perturbative importance instead of arbitrary order.
 
         OPTIMIZED: Uses GPU-based integer encoding with single CPU transfer
         instead of per-connection CPU transfers.
@@ -1153,8 +1414,11 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         if max_new_per_step is None:
             max_new_per_step = cfg.max_new_configs_per_krylov_step
 
-        # Precompute powers of 2 on GPU for fast integer encoding
-        powers = (2 ** torch.arange(n_sites, device=device, dtype=torch.long)).flip(0)
+        # Overflow-safe integer encoding (handles n_sites >= 64)
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
 
         # Calculate how many basis states to sample
         # Use fraction-based sampling with configurable minimum
@@ -1168,69 +1432,173 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         # Prefer exploring connections of high-amplitude basis states
         if hasattr(self, '_nf_guided_psi') and self._nf_guided_psi is not None:
             psi = self._nf_guided_psi
-            probs = np.abs(psi[:len(basis)]) ** 2
+            n_psi = len(psi)
+            n_basis = len(basis)
+            if n_psi < n_basis:
+                # Basis grew since psi was computed — pad with small uniform weight
+                probs = np.zeros(n_basis)
+                probs[:n_psi] = np.abs(psi) ** 2
+                probs[n_psi:] = 1e-10
+            else:
+                probs = np.abs(psi[:n_basis]) ** 2
             probs = probs / probs.sum()
             indices_np = np.random.choice(
-                len(basis), size=n_sample, replace=False, p=probs
+                n_basis, size=n_sample, replace=False, p=probs
             )
             indices = torch.from_numpy(indices_np)
         else:
             indices = torch.randperm(len(basis))[:n_sample]
 
-        # B4: Use vectorized batch method if available (avoids per-config Python loop)
+        # B4: Streaming connection discovery with per-chunk dedup.
+        # Processes sampled basis in chunks to bound peak memory at ~2GB
+        # instead of materializing all connected configs at once.
+        CHUNK_SIZE = 500  # configs per chunk — bounds intermediate tensors
+
         sampled_basis = basis[indices]
-        if hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
-            all_connected, _, _ = self.hamiltonian.get_connections_vectorized_batch(sampled_basis)
-        else:
-            all_connected_list = []
-            for idx in indices:
-                connected, elements = self.hamiltonian.get_connections(basis[idx])
-                if len(connected) > 0:
-                    all_connected_list.append(connected)
-            if not all_connected_list:
-                return torch.empty(0, n_sites, device=device)
-            all_connected = torch.cat(all_connected_list, dim=0)
-
-        if len(all_connected) == 0:
-            return torch.empty(0, n_sites, device=device)
-
-        # GPU-based integer encoding (single operation)
-        connected_ints = (all_connected.long() * powers).sum(dim=1)
-
-        # Single CPU transfer for membership check
-        connected_ints_cpu = connected_ints.cpu().tolist()
-
-        # Find new configs not in basis_set
         new_set = set()
-        new_indices = []
-        for i, config_int in enumerate(connected_ints_cpu):
-            if config_int not in basis_set and config_int not in new_set:
-                new_set.add(config_int)
-                new_indices.append(i)
-                if len(new_indices) >= max_new_per_step:
-                    break
+        new_config_chunks = []
 
-        if not new_indices:
+        for chunk_start in range(0, len(sampled_basis), CHUNK_SIZE):
+            chunk = sampled_basis[chunk_start:chunk_start + CHUNK_SIZE]
+
+            if hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
+                chunk_connected, _, _ = self.hamiltonian.get_connections_vectorized_batch(chunk)
+            else:
+                chunk_connected_list = []
+                for c in chunk:
+                    connected, _ = self.hamiltonian.get_connections(c)
+                    if len(connected) > 0:
+                        chunk_connected_list.append(connected)
+                if not chunk_connected_list:
+                    continue
+                chunk_connected = torch.cat(chunk_connected_list, dim=0)
+
+            if len(chunk_connected) == 0:
+                continue
+
+            # Dedup this chunk against basis_set and already-found new configs
+            chunk_ints = config_integer_hash(chunk_connected)
+            chunk_new_indices = []
+            for i, h in enumerate(chunk_ints):
+                if h not in basis_set and h not in new_set:
+                    new_set.add(h)
+                    chunk_new_indices.append(i)
+
+            if chunk_new_indices:
+                new_config_chunks.append(chunk_connected[chunk_new_indices])
+
+        if not new_config_chunks:
             return torch.empty(0, n_sites, device=device)
 
-        return all_connected[new_indices]
+        new_configs = torch.cat(new_config_chunks, dim=0)
 
-    def _build_hamiltonian_in_basis_gpu(self, basis: torch.Tensor) -> torch.Tensor:
+        # If MP2 t2 amplitudes are cached, rank by importance instead of arbitrary order
+        if len(new_configs) > max_new_per_step and hasattr(self, '_mp2_t2') and self._mp2_t2 is not None:
+            try:
+                from utils.perturbative_pruning import mp2_importance_scores, _classify_excitation
+            except ImportError:
+                from ..utils.perturbative_pruning import mp2_importance_scores, _classify_excitation
+
+            scores = mp2_importance_scores(new_configs.cpu(), self.hamiltonian)
+            _, top_indices = torch.topk(scores, min(max_new_per_step, len(scores)))
+            return new_configs[top_indices]
+
+        return new_configs[:max_new_per_step]
+
+    # Threshold above which Krylov time evolution uses sparse H construction
+    KRYLOV_SPARSE_THRESHOLD = 5000
+
+    def _build_hamiltonian_in_basis_gpu(self, basis: torch.Tensor):
         """
-        Build dense Hamiltonian matrix in given basis, entirely on GPU.
+        Build Hamiltonian matrix in given basis for time evolution.
 
-        Uses hamiltonian.matrix_elements() which returns a GPU torch tensor.
-        This avoids the scipy sparse CPU path entirely.
+        For small bases (< KRYLOV_SPARSE_THRESHOLD), builds dense matrix on GPU.
+        For large bases, builds sparse CSR on CPU (scipy) for direct use with
+        scipy.sparse.linalg.expm_multiply — avoids expensive torch sparse COO
+        conversion and slow PyTorch sparse matmul on ARM64.
 
         Returns:
-            Dense Hamiltonian matrix (n, n) as complex128 torch tensor on device.
+            Dense torch.Tensor (complex128) for small bases, or
+            scipy.sparse.csr_matrix (float64) for large bases.
         """
-        H = self.hamiltonian.matrix_elements(basis, basis)
-        # Ensure complex128 for time evolution compatibility
-        H = H.to(torch.complex128)
-        # Symmetrize on GPU
-        H = 0.5 * (H + H.conj().T)
-        return H
+        n = len(basis)
+
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from ..utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+
+        if n < self.KRYLOV_SPARSE_THRESHOLD:
+            # Dense path — fast for small systems
+            if log_allocation:
+                log_allocation("_build_hamiltonian_in_basis_gpu", n, dtype="complex128", layout="dense")
+            H = self.hamiltonian.matrix_elements(basis, basis)
+            H = H.to(torch.complex128)
+            H = 0.5 * (H + H.conj().T)
+            return H
+
+        # Sparse path — returns scipy CSR directly (no torch conversion)
+        if log_allocation:
+            log_allocation("_build_hamiltonian_in_basis_gpu", n, dtype="float64", layout="sparse")
+        try:
+            from scipy.sparse import coo_matrix, diags
+
+            rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
+            rows_np = rows.cpu().numpy()
+            cols_np = cols.cpu().numpy()
+            vals_np = vals.cpu().numpy().astype(np.float64)
+
+            H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n, n))
+            diag_np = self.hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+            H_csr = H_coo.tocsr()
+            H_csr = 0.5 * (H_csr + H_csr.T)
+            H_csr = H_csr + diags(diag_np, 0, shape=(n, n), format='csr')
+
+            return H_csr
+        except Exception as e:
+            # For large bases, do NOT fall back to dense — it would cause OOM.
+            # Dense fallback is only safe for small bases (< KRYLOV_SPARSE_THRESHOLD).
+            if n >= self.KRYLOV_SPARSE_THRESHOLD:
+                raise RuntimeError(
+                    f"Sparse Krylov H build failed for {n} configs ({e}). "
+                    f"Dense fallback refused (would allocate {n**2 * 16 / 1e9:.1f} GB). "
+                    f"Fix the sparse path instead."
+                ) from e
+            print(f"  Sparse Krylov H build failed ({e}), falling back to dense (n={n} < {self.KRYLOV_SPARSE_THRESHOLD})")
+            H = self.hamiltonian.matrix_elements(basis, basis)
+            H = H.to(torch.complex128)
+            H = 0.5 * (H + H.conj().T)
+            return H
+
+    def _expm_multiply_step(self, H, psi: torch.Tensor, dt: float) -> torch.Tensor:
+        """
+        Compute exp(-i*dt*H) @ psi, dispatching to the best backend.
+
+        For dense torch.Tensor H: uses gpu_expm_multiply (GPU matrix_exp or Lanczos).
+        For scipy sparse CSR H: uses scipy.sparse.linalg.expm_multiply (Al-Mohy &
+        Higham algorithm). This avoids converting CSR → torch sparse COO and the
+        slow PyTorch sparse matmul on ARM64/SM121.
+
+        Args:
+            H: Hamiltonian matrix (torch.Tensor or scipy.sparse.csr_matrix)
+            psi: State vector (torch complex128)
+            dt: Time step
+
+        Returns:
+            exp(-i*dt*H) @ psi as torch complex128 tensor on same device as psi
+        """
+        from scipy.sparse import issparse
+
+        if issparse(H):
+            from scipy.sparse.linalg import expm_multiply
+            psi_np = psi.cpu().numpy()
+            result_np = expm_multiply(-1j * dt * H, psi_np)
+            return torch.from_numpy(result_np).to(device=psi.device, dtype=torch.complex128)
+        else:
+            return gpu_expm_multiply(H, psi, t=-1j * dt)
 
     def _build_hamiltonian_in_basis(self, basis: torch.Tensor):
         """
@@ -1248,11 +1616,13 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         device = basis.device
         n_sites = basis.shape[1]
 
-        # Precompute powers of 2 on GPU for fast integer encoding
-        powers = (2 ** torch.arange(n_sites, device=device, dtype=torch.long)).flip(0)
+        # Overflow-safe integer encoding (handles n_sites >= 64)
+        try:
+            from utils.config_hash import config_integer_hash
+        except ImportError:
+            from ..utils.config_hash import config_integer_hash
 
-        # Create index mapping using GPU-based integer encoding (single CPU transfer)
-        basis_ints = (basis.long() * powers).sum(dim=1).cpu().tolist()
+        basis_ints = config_integer_hash(basis)
         basis_map = {config_int: i for i, config_int in enumerate(basis_ints)}
 
         rows, cols, data = [], [], []
@@ -1276,7 +1646,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         if hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
             all_connected, all_elements, batch_idx = self.hamiltonian.get_connections_vectorized_batch(basis)
             if len(all_connected) > 0:
-                connected_ints = (all_connected.long() * powers).sum(dim=1).cpu().tolist()
+                connected_ints = config_integer_hash(all_connected)
                 batch_idx_cpu = batch_idx.cpu().tolist()
                 all_elem_cpu = all_elements.cpu().tolist() if hasattr(all_elements, 'cpu') else list(all_elements)
                 for k_idx, config_int in enumerate(connected_ints):
@@ -1291,7 +1661,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                 connected, elements = self.hamiltonian.get_connections(basis[j])
                 if len(connected) == 0:
                     continue
-                connected_ints = (connected.long() * powers).sum(dim=1).cpu().tolist()
+                connected_ints = config_integer_hash(connected)
                 for k, config_int in enumerate(connected_ints):
                     if config_int in basis_map:
                         i = basis_map[config_int]
@@ -1328,6 +1698,46 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
         return results
 
+    def _compute_adaptive_dt(self, basis: torch.Tensor) -> float:
+        """
+        Compute safe time step based on spectral range of diagonal elements.
+
+        The Nyquist-like condition dt <= pi / spectral_range prevents aliasing
+        when the Hamiltonian has wide eigenvalue spread. If adaptive_dt is
+        disabled in config, returns the configured time_step unchanged.
+
+        Args:
+            basis: Basis configurations to estimate spectral range from.
+
+        Returns:
+            Effective dt (may be smaller than config.time_step).
+        """
+        if not self.config.adaptive_dt:
+            return self.config.time_step
+
+        # Estimate spectral range from diagonal elements
+        if hasattr(self.hamiltonian, 'diagonal_elements_batch'):
+            diag = self.hamiltonian.diagonal_elements_batch(basis)
+            diag_np = diag.cpu().numpy().astype(np.float64)
+        else:
+            diag_np = np.array([
+                self.hamiltonian.diagonal_element(c).item() for c in basis
+            ], dtype=np.float64)
+
+        spectral_range = float(diag_np.max() - diag_np.min())
+
+        if spectral_range <= 0:
+            return self.config.time_step
+
+        dt_safe = np.pi / spectral_range
+        effective_dt = min(self.config.time_step, dt_safe)
+
+        if effective_dt < self.config.time_step:
+            print(f"Adaptive dt: {self.config.time_step:.4f} -> {effective_dt:.6f} "
+                  f"(spectral_range={spectral_range:.4f})")
+
+        return effective_dt
+
     def run_with_nf(
         self,
         max_krylov_dim: Optional[int] = None,
@@ -1353,10 +1763,17 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         - Uses float64 for better numerical precision
 
         Returns:
-            Dictionary with results comparing NF-only, Krylov-only, and combined
+            Dictionary with results comparing NF-only, Krylov-only, and combined.
+            Includes energy_history, effective_dt, converged, ill_conditioned_stop.
         """
         if max_krylov_dim is None:
             max_krylov_dim = self.config.max_krylov_dim
+
+        # === PR-A2: Adaptive dt scaling ===
+        effective_dt = self._compute_adaptive_dt(self.nf_basis)
+        # Temporarily override time_step for Krylov generation
+        original_dt = self.time_step
+        self.time_step = effective_dt
 
         # Energy with NF basis only (reference for stability check)
         E_nf, _ = self.compute_ground_state_energy(
@@ -1371,6 +1788,9 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
         else:
             self.generate_krylov_samples(max_krylov_dim, progress=progress)
 
+        # Restore original dt
+        self.time_step = original_dt
+
         results = {
             "krylov_dims": [],
             "energies_krylov": [],
@@ -1380,11 +1800,17 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             "energy_nf_only": E_nf,
             "nf_basis_size": len(self.nf_basis),
             "numerical_warnings": [],
+            # PR-A2 additions
+            "energy_history": [],
+            "effective_dt": effective_dt,
+            "converged": False,
+            "ill_conditioned_stop": False,
         }
 
         best_energy = E_nf
         best_basis_size = len(self.nf_basis)
         instability_detected = False
+        convergence_threshold = self.config.convergence_threshold
 
         # For large systems (>10k configs), skip per-dimension diagnostics
         # and only compute final energy to avoid expensive matrix builds
@@ -1408,6 +1834,7 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
             results["energies_combined"].append(E_combined)
             results["basis_sizes_krylov"].append(len(krylov_basis))
             results["basis_sizes_combined"].append(len(combined_basis))
+            results["energy_history"].append(E_combined)
 
             best_energy = E_combined
             best_basis_size = len(combined_basis)
@@ -1419,12 +1846,37 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
                 # Combined: NF basis + Krylov-discovered configs
                 combined_basis = self.get_combined_basis(k, include_nf=True)
+
+                # === PR-A2: Conditioning guard ===
+                # Reset flag before eigensolve. compute_ground_state_energy()
+                # sets _last_ill_conditioned=True when cond(H) > 1e12.
+                self._last_ill_conditioned = False
+
                 E_combined, _ = self.compute_ground_state_energy(
                     combined_basis,
                     regularization=self.config.regularization
                 )
                 # Use combined energy as krylov estimate too (avoids second eigsh call)
                 E_krylov = E_combined
+
+                # Check if compute_ground_state_energy detected ill-conditioning
+                if getattr(self, '_last_ill_conditioned', False):
+                    print(f"WARNING: Ill-conditioned H at k={k+1}. "
+                          f"Stopping Krylov expansion early.")
+                    results["ill_conditioned_stop"] = True
+                    results["energy_history"].append(E_combined)
+                    if E_combined < best_energy:
+                        best_energy = E_combined
+                        best_basis_size = len(combined_basis)
+                    results["krylov_dims"].append(k + 1)
+                    results["energies_krylov"].append(E_krylov)
+                    results["energies_combined"].append(E_combined)
+                    results["basis_sizes_krylov"].append(len(krylov_basis))
+                    results["basis_sizes_combined"].append(len(combined_basis))
+                    break
+
+                # Record energy in history
+                results["energy_history"].append(E_combined)
 
                 # VARIATIONAL CHECK: Energy should decrease or stay same as basis grows
                 # If energy increases, likely numerical instability
@@ -1434,14 +1886,20 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
 
                     # Energy should not increase significantly
                     if energy_change > 0.001:  # 1 mHa tolerance
-                        warning = f"k={k+1}: Energy increased by {energy_change*1000:.4f} mHa (numerical instability)"
+                        warning = (
+                            f"k={k+1}: Energy increased by "
+                            f"{energy_change*1000:.4f} mHa (numerical instability)"
+                        )
                         results["numerical_warnings"].append(warning)
                         print(f"WARNING: {warning}")
                         instability_detected = True
 
                     # Large energy jumps can indicate numerical instability
-                    if abs(energy_change) > 1.0:  # 1 Ha is suspicious for Krylov refinement
-                        warning = f"k={k+1}: Large energy jump {abs(energy_change):.4f} Ha"
+                    if abs(energy_change) > 1.0:  # 1 Ha is suspicious
+                        warning = (
+                            f"k={k+1}: Large energy jump "
+                            f"{abs(energy_change):.4f} Ha"
+                        )
                         results["numerical_warnings"].append(warning)
                         print(f"WARNING: {warning}")
                         instability_detected = True
@@ -1456,6 +1914,34 @@ class FlowGuidedSKQD(SampleBasedKrylovDiagonalization):
                 results["energies_combined"].append(E_combined)
                 results["basis_sizes_krylov"].append(len(krylov_basis))
                 results["basis_sizes_combined"].append(len(combined_basis))
+
+                # === PR-A2: Energy convergence early stopping ===
+                _CONVERGENCE_WINDOW = 3
+                initial_basis_size = results["nf_basis_size"]
+                basis_has_grown = any(
+                    s > initial_basis_size
+                    for s in results["basis_sizes_combined"]
+                )
+                hist = results["energy_history"]
+                if (
+                    convergence_threshold > 0
+                    and len(hist) >= _CONVERGENCE_WINDOW + 1
+                    and basis_has_grown
+                ):
+                    window_converged = True
+                    for wi in range(1, _CONVERGENCE_WINDOW + 1):
+                        if abs(hist[-wi] - hist[-wi - 1]) >= convergence_threshold:
+                            window_converged = False
+                            break
+                    if window_converged:
+                        delta_E = abs(hist[-1] - hist[-2])
+                        print(
+                            f"Energy converged at k={k+1}: "
+                            f"|dE|={delta_E:.2e} < {convergence_threshold:.2e} "
+                            f"(stable for {_CONVERGENCE_WINDOW} steps)"
+                        )
+                        results["converged"] = True
+                        break
 
         # Report statistics on Krylov contribution
         if results["energies_combined"]:

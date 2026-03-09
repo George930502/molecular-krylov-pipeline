@@ -32,19 +32,25 @@ try:
         ParticleConservingFlowSampler,
         verify_particle_conservation,
     )
+    from .flows.autoregressive_flow import AutoregressiveFlowSampler
     from .flows.physics_guided_training import (
         PhysicsGuidedFlowTrainer,
         PhysicsGuidedConfig,
     )
+    from .flows.vmc_training import VMCTrainer, VMCConfig
+    from .flows.sign_network import SignNetwork
 except ImportError:
     from flows.particle_conserving_flow import (
         ParticleConservingFlowSampler,
         verify_particle_conservation,
     )
+    from flows.autoregressive_flow import AutoregressiveFlowSampler
     from flows.physics_guided_training import (
         PhysicsGuidedFlowTrainer,
         PhysicsGuidedConfig,
     )
+    from flows.vmc_training import VMCTrainer, VMCConfig
+    from flows.sign_network import SignNetwork
 
 # NQS components
 try:
@@ -65,21 +71,11 @@ try:
     from .postprocessing.diversity_selection import (
         DiversitySelector,
         DiversityConfig,
-        select_diverse_basis,
-    )
-    from .postprocessing.eigensolver import (
-        davidson_eigensolver,
-        adaptive_eigensolver,
     )
 except ImportError:
     from postprocessing.diversity_selection import (
         DiversitySelector,
         DiversityConfig,
-        select_diverse_basis,
-    )
-    from postprocessing.eigensolver import (
-        davidson_eigensolver,
-        adaptive_eigensolver,
     )
 
 # Krylov / subspace diagonalization components
@@ -109,6 +105,10 @@ class PipelineConfig:
 
     # Flow type
     use_particle_conserving_flow: bool = True  # Use particle-conserving flow for molecules
+    # Autoregressive transformer flow (Phase 4a): captures inter-orbital correlations.
+    # When True, uses AutoregressiveFlowSampler instead of ParticleConservingFlowSampler.
+    # None = auto (adapt_to_system_size decides: >20K configs -> autoregressive)
+    use_autoregressive_flow: Optional[bool] = None
 
     # NF-NQS architecture
     nf_hidden_dims: list = field(default_factory=lambda: [256, 256])
@@ -143,34 +143,78 @@ class PipelineConfig:
     subspace_mode: str = "skqd"  # "skqd" (Krylov time evolution) or "sqd" (SQD sampling-based)
 
     # SQD-specific parameters (used when subspace_mode="sqd")
-    sqd_num_batches: int = 5           # K batches for independent diagonalization
-    sqd_batch_size: int = 0            # d configs per batch (0 = auto from NF samples)
-    sqd_self_consistent_iters: int = 3 # Self-consistent config recovery iterations
-    sqd_spin_penalty: float = 0.0      # Lambda for S^2 penalty (0 = disabled)
-    sqd_noise_rate: float = 0.0        # Depolarizing noise rate for SQD recovery mode (0 = clean SQD)
-    sqd_use_spin_symmetry: bool = True # Spin-up/down recombination in SQD batches
+    sqd_num_batches: int = 5  # K batches for independent diagonalization
+    sqd_batch_size: int = 0  # d configs per batch (0 = auto from NF samples)
+    sqd_self_consistent_iters: int = 3  # Self-consistent config recovery iterations
+    sqd_spin_penalty: float = 0.0  # Lambda for S^2 penalty (0 = disabled)
+    sqd_noise_rate: float = 0.0  # Depolarizing noise rate for SQD recovery mode (0 = clean SQD)
+    sqd_use_spin_symmetry: bool = True  # Spin-up/down recombination in SQD batches
 
     # SKQD parameters (used when subspace_mode="skqd")
     max_krylov_dim: int = 8
     time_step: float = 0.1
     shots_per_krylov: int = 50000
     skqd_regularization: float = 1e-8  # Regularization for numerical stability
+    max_diag_basis_size: int = 15000  # Max basis for diag (matches SKQDConfig default)
     skip_skqd: bool = False  # Skip Krylov refinement (for NF-only mode comparison)
+    skqd_convergence_threshold: float = 1e-5  # Energy convergence threshold (Ha)
+    skqd_adaptive_dt: bool = False  # Adaptive dt based on spectral range
+
+    # NNCI parameters (Neural Network Configuration Interaction)
+    # NNCI uses a feedforward NN to classify important higher-excitation configs
+    # (triples, quadruples) beyond CISD, expanding the basis via active learning.
+    # None = auto (adapt_to_system_size decides based on system size)
+    use_nnci: Optional[bool] = None
+    nnci_iterations: int = 5  # Active learning iterations
+    nnci_candidates_per_iter: int = 5000  # Max candidates to generate per iteration
 
     # Training mode
     use_local_energy: bool = True  # Use VMC local energy (proper variational estimator)
-    use_ci_seeding: bool = False  # Seed with CI basis (set True if NF struggles)
 
-    # Eigensolver
-    use_davidson: bool = True
-    davidson_threshold: int = 500  # Use Davidson for bases larger than this
+    # VMC (Variational Monte Carlo) training mode
+    # When True, after NF training (or instead of it), runs VMC to directly minimize
+    # the variational energy <psi|H|psi> using REINFORCE on the autoregressive flow.
+    # Requires use_autoregressive_flow=True.
+    use_vmc_training: bool = False
+    vmc_n_steps: int = 500  # VMC optimization steps
+    vmc_lr: float = 1e-3  # VMC learning rate
+    vmc_n_samples: int = 2000  # Samples per VMC step
+
+    # Sign network for wavefunction sign structure
+    # When True, adds a small feedforward network that learns sign(ψ(x)),
+    # enabling the VMC ansatz ψ(x) = √p(x) × s(x) to represent wavefunctions
+    # with negative CI coefficients.  Requires use_vmc_training=True.
+    use_sign_network: bool = False
 
     # Direct-CI mode: skip NF-NQS training entirely
     # When True, pipeline uses essential configs (HF + singles + doubles) → subspace diagonalization
-    skip_nf_training: bool = False
+    # None = auto (let adapt_to_system_size decide based on system size)
+    skip_nf_training: Optional[bool] = None
 
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def __post_init__(self):
+        # Track if user explicitly set skip_nf_training (True or False)
+        # so adapt_to_system_size() won't override their choice.
+        if self.skip_nf_training is not None:
+            self._user_set_skip_nf = True
+        else:
+            self.skip_nf_training = False  # Resolve None to default False
+
+        # Track if user explicitly set use_nnci (True or False)
+        # so adapt_to_system_size() won't override their choice.
+        if self.use_nnci is not None:
+            self._user_set_nnci = True
+        else:
+            self.use_nnci = False  # Resolve None to default False
+
+        # Track if user explicitly set use_autoregressive_flow (True or False)
+        # so adapt_to_system_size() won't override their choice.
+        if self.use_autoregressive_flow is not None:
+            self._user_set_autoregressive_flow = True
+        else:
+            self.use_autoregressive_flow = False  # Resolve None to default False
 
     # === PERFORMANCE OPTIMIZATIONS FOR LARGE SYSTEMS ===
     # These dramatically reduce training time for large molecules (>20 qubits)
@@ -199,7 +243,7 @@ class PipelineConfig:
             Updated config (modifies self in-place and returns)
         """
         # Skip if already adapted to same size
-        if hasattr(self, '_adapted_size') and self._adapted_size == n_valid_configs:
+        if hasattr(self, "_adapted_size") and self._adapted_size == n_valid_configs:
             return self
 
         # Determine system complexity tier
@@ -212,14 +256,50 @@ class PipelineConfig:
         else:
             tier = "very_large"
 
-        # For molecular systems, skip NF training by default (Direct-CI mode)
-        # Essential configs (HF + singles + doubles) provide a strong initial basis
-        self.skip_nf_training = True
+        # Conditional NF training based on system size (PR 2.1 / ADR-001)
+        # Systems <= 20K configs: Direct-CI sufficient (HF + singles + doubles)
+        # Systems > 20K configs: NF training beneficial for finding important higher excitations
+        # User explicit override (_user_set_skip_nf) is always preserved
+        if not hasattr(self, "_user_set_skip_nf"):
+            if n_valid_configs <= 20000:
+                self.skip_nf_training = True
+            else:
+                self.skip_nf_training = False
+
+        # Conditional NNCI based on system size (PR-B1)
+        # Systems > 20K configs: NNCI discovers important triples/quadruples via NN classifier
+        # User explicit override (_user_set_nnci) is always preserved
+        if not hasattr(self, "_user_set_nnci"):
+            if n_valid_configs > 20000:
+                self.use_nnci = True
+            else:
+                self.use_nnci = False
+
+        # Conditional autoregressive flow based on system size (Phase 4a)
+        # Systems > 20K configs: autoregressive transformer captures inter-orbital
+        # correlations that the non-autoregressive product-of-marginals model cannot.
+        # User explicit override (_user_set_autoregressive_flow) is always preserved.
+        if not hasattr(self, "_user_set_autoregressive_flow"):
+            if n_valid_configs > 20000:
+                self.use_autoregressive_flow = True
+            else:
+                self.use_autoregressive_flow = False
 
         if verbose:
             print(f"System size: {n_valid_configs:,} valid configs -> {tier} tier")
             if self.skip_nf_training:
-                print(f"Direct-CI mode: skipping NF-NQS training")
+                if hasattr(self, "_user_set_skip_nf"):
+                    print("Direct-CI mode: user override (skip_nf_training=True)")
+                else:
+                    print(f"Direct-CI mode: {n_valid_configs:,} configs <= 20K threshold")
+            else:
+                if hasattr(self, "_user_set_skip_nf"):
+                    print("NF training enabled: user override (skip_nf_training=False)")
+                else:
+                    print(
+                        f"NF training enabled: {n_valid_configs:,} configs exceeds "
+                        f"Direct-CI threshold (20K)"
+                    )
 
         if tier == "small":
             # Small systems: default parameters are fine
@@ -243,11 +323,14 @@ class PipelineConfig:
             # Large systems: aggressive basis collection
             self.max_accumulated_basis = min(n_valid_configs, 12288)
             self.max_diverse_configs = min(n_valid_configs, 8192)
+            self.max_diag_basis_size = 25000
             # Larger networks
             self.nqs_hidden_dims = [512, 512, 512, 512, 512]
             # More training
             self.max_epochs = max(self.max_epochs, 600)
             self.samples_per_batch = 4000
+            # Enable adaptive dt for large systems (prevents aliasing)
+            self.skqd_adaptive_dt = True
             # SQD: more batches
             if self.subspace_mode == "sqd":
                 self.sqd_num_batches = max(self.sqd_num_batches, 10)
@@ -258,6 +341,10 @@ class PipelineConfig:
             # Very large systems (>20K valid configs, e.g. C2H4 with 9M)
             self.max_accumulated_basis = 16384
             self.max_diverse_configs = min(n_valid_configs, 12288)
+            # Keep aligned with MAX_FULL_SUBSPACE_SIZE (15000) to ensure
+            # even dense fallback paths stay within memory budget.
+            # 15000² × 16 (complex128) = 3.6 GB — safe on DGX Spark 128GB UMA.
+            self.max_diag_basis_size = 15000
 
             # Network capacity
             self.nqs_hidden_dims = [512, 512, 512, 512]
@@ -275,6 +362,8 @@ class PipelineConfig:
 
             # Reduce Krylov dimension for large systems
             self.max_krylov_dim = 4
+            # Enable adaptive dt for very large systems (prevents aliasing)
+            self.skqd_adaptive_dt = True
 
             # SQD: more batches for large systems
             if self.subspace_mode == "sqd":
@@ -289,8 +378,12 @@ class PipelineConfig:
         if verbose:
             print(f"Adapted parameters:")
             print(f"  subspace_mode: {self.subspace_mode}")
-            print(f"  max_accumulated_basis: {self.max_accumulated_basis:,} ({coverage_accumulated*100:.1f}% of valid)")
-            print(f"  max_diverse_configs: {self.max_diverse_configs:,} ({coverage_diverse*100:.1f}% of valid)")
+            print(
+                f"  max_accumulated_basis: {self.max_accumulated_basis:,} ({coverage_accumulated*100:.1f}% of valid)"
+            )
+            print(
+                f"  max_diverse_configs: {self.max_diverse_configs:,} ({coverage_diverse*100:.1f}% of valid)"
+            )
             print(f"  NQS hidden dims: {self.nqs_hidden_dims}")
 
         # Mark as adapted to prevent duplicate adaptation
@@ -379,18 +472,41 @@ class FlowGuidedKrylovPipeline:
         """Initialize flow, NQS, and auxiliary components."""
         cfg = self.config
 
-        # Initialize particle-conserving flow for molecules
+        # Initialize flow sampler for molecules — skip if Direct-CI mode
+        # (avoid allocating GPU memory for a model that won't be used)
         n_alpha = self.hamiltonian.n_alpha
         n_beta = self.hamiltonian.n_beta
 
-        self.flow = ParticleConservingFlowSampler(
-            num_sites=self.num_sites,
-            n_alpha=n_alpha,
-            n_beta=n_beta,
-            hidden_dims=cfg.nf_hidden_dims,
-        ).to(self.device)
+        if cfg.skip_nf_training and not cfg.use_vmc_training:
+            self.flow = None
+            print("Direct-CI mode: flow sampler not initialized (saves GPU memory)")
+        elif cfg.use_autoregressive_flow:
+            self.flow = AutoregressiveFlowSampler(
+                num_sites=self.num_sites,
+                n_alpha=n_alpha,
+                n_beta=n_beta,
+            ).to(self.device)
+            print(
+                f"Using autoregressive transformer flow: "
+                f"{n_alpha}\u03b1 + {n_beta}\u03b2 electrons"
+            )
+        else:
+            self.flow = ParticleConservingFlowSampler(
+                num_sites=self.num_sites,
+                n_alpha=n_alpha,
+                n_beta=n_beta,
+                hidden_dims=cfg.nf_hidden_dims,
+            ).to(self.device)
+            print(f"Using particle-conserving flow: " f"{n_alpha}\u03b1 + {n_beta}\u03b2 electrons")
 
-        print(f"Using particle-conserving flow: {n_alpha}α + {n_beta}β electrons")
+        # Sign network for wavefunction sign structure
+        if cfg.use_sign_network and cfg.use_vmc_training:
+            self.sign_network = SignNetwork(num_sites=self.num_sites).to(self.device)
+            print(f"Sign network initialized ({sum(p.numel() for p in self.sign_network.parameters())} params)")
+        else:
+            if cfg.use_sign_network and not cfg.use_vmc_training:
+                print("WARNING: use_sign_network=True requires use_vmc_training=True. Sign network not created.")
+            self.sign_network = None
 
         # Neural Quantum State
         self.nqs = DenseNQS(
@@ -440,14 +556,40 @@ class FlowGuidedKrylovPipeline:
                 new_config[a + n_orb] = 1
                 essential.append(new_config)
 
-        # Double excitations (with limit for large systems)
+        # Double excitations with proportional allocation per type.
+        # αβ doubles dominate correlation energy, so each type gets a fair
+        # share proportional to its total count, with αβ guaranteed >= 50%.
         max_doubles = 5000
-        doubles_count = 0
+        from math import comb as _comb
+
+        n_aa_total = _comb(n_alpha, 2) * _comb(len(virt_alpha), 2)
+        n_bb_total = _comb(n_beta, 2) * _comb(len(virt_beta), 2)
+        n_ab_total = n_alpha * n_beta * len(virt_alpha) * len(virt_beta)
+        total_possible = n_aa_total + n_bb_total + n_ab_total
+
+        if total_possible <= max_doubles:
+            max_aa = n_aa_total
+            max_bb = n_bb_total
+            max_ab = n_ab_total
+        else:
+            # Proportional allocation with αβ floor of 50%
+            ab_frac = max(0.5, n_ab_total / total_possible if total_possible > 0 else 0.5)
+            remaining_frac = 1.0 - ab_frac
+            aa_frac = (
+                remaining_frac * (n_aa_total / (n_aa_total + n_bb_total))
+                if (n_aa_total + n_bb_total) > 0
+                else 0
+            )
+            bb_frac = remaining_frac - aa_frac
+            max_ab = int(ab_frac * max_doubles)
+            max_aa = int(aa_frac * max_doubles)
+            max_bb = max_doubles - max_ab - max_aa
 
         # Alpha-alpha doubles
+        aa_count = 0
         for i, j in combinations(occ_alpha, 2):
             for a, b in combinations(virt_alpha, 2):
-                if doubles_count >= max_doubles:
+                if aa_count >= max_aa:
                     break
                 new_config = hf_state.clone()
                 new_config[i] = 0
@@ -455,14 +597,15 @@ class FlowGuidedKrylovPipeline:
                 new_config[a] = 1
                 new_config[b] = 1
                 essential.append(new_config)
-                doubles_count += 1
-            if doubles_count >= max_doubles:
+                aa_count += 1
+            if aa_count >= max_aa:
                 break
 
         # Beta-beta doubles
+        bb_count = 0
         for i, j in combinations(occ_beta, 2):
             for a, b in combinations(virt_beta, 2):
-                if doubles_count >= max_doubles:
+                if bb_count >= max_bb:
                     break
                 new_config = hf_state.clone()
                 new_config[i + n_orb] = 0
@@ -470,16 +613,17 @@ class FlowGuidedKrylovPipeline:
                 new_config[a + n_orb] = 1
                 new_config[b + n_orb] = 1
                 essential.append(new_config)
-                doubles_count += 1
-            if doubles_count >= max_doubles:
+                bb_count += 1
+            if bb_count >= max_bb:
                 break
 
         # Alpha-beta doubles (most important for correlation)
+        ab_count = 0
         for i in occ_alpha:
             for j in occ_beta:
                 for a in virt_alpha:
                     for b in virt_beta:
-                        if doubles_count >= max_doubles:
+                        if ab_count >= max_ab:
                             break
                         new_config = hf_state.clone()
                         new_config[i] = 0
@@ -487,22 +631,25 @@ class FlowGuidedKrylovPipeline:
                         new_config[a] = 1
                         new_config[b + n_orb] = 1
                         essential.append(new_config)
-                        doubles_count += 1
-                    if doubles_count >= max_doubles:
+                        ab_count += 1
+                    if ab_count >= max_ab:
                         break
-                if doubles_count >= max_doubles:
+                if ab_count >= max_ab:
                     break
-            if doubles_count >= max_doubles:
+            if ab_count >= max_ab:
                 break
 
         essential_tensor = torch.stack(essential).to(self.device)
         essential_tensor = torch.unique(essential_tensor, dim=0)
 
-        n_singles = len([c for c in essential if torch.sum(torch.abs(c - hf_state)) == 2])
+        hf_dev = hf_state.to(essential_tensor.device)
+        n_singles = sum(1 for c in essential_tensor if torch.sum(torch.abs(c - hf_dev)) == 2)
         n_doubles = len(essential_tensor) - n_singles - 1
 
-        print(f"Generated {len(essential_tensor)} essential configs: "
-              f"1 HF + {n_singles} singles + {n_doubles} doubles")
+        print(
+            f"Generated {len(essential_tensor)} essential configs: "
+            f"1 HF + {n_singles} singles + {n_doubles} doubles"
+        )
 
         return essential_tensor
 
@@ -561,9 +708,50 @@ class FlowGuidedKrylovPipeline:
         history = self.trainer.train()
 
         self.results["training_history"] = history
-        self.results["nf_nqs_energy"] = history["energies"][-1]
+        self.results["nf_nqs_energy"] = history["energies"][-1] if history.get("energies") else None
 
         return history
+
+    def _run_vmc_training(self):
+        """Stage 1b: VMC training to directly minimize variational energy.
+
+        Uses REINFORCE on the autoregressive flow to minimize <psi|H|psi>.
+        Only runs when ``use_vmc_training=True`` and the flow is autoregressive.
+        """
+        cfg = self.config
+
+        if not isinstance(self.flow, AutoregressiveFlowSampler):
+            print(
+                "WARNING: VMC training requires AutoregressiveFlowSampler. "
+                "Set use_autoregressive_flow=True. Skipping VMC."
+            )
+            self.results["vmc_energy"] = None
+            return
+
+        print("\n" + "=" * 60)
+        print("Stage 1b: VMC Training (Variational Monte Carlo)")
+        print("=" * 60)
+
+        vmc_config = VMCConfig(
+            n_samples=cfg.vmc_n_samples,
+            n_steps=cfg.vmc_n_steps,
+            lr=cfg.vmc_lr,
+        )
+
+        vmc_trainer = VMCTrainer(
+            flow=self.flow,
+            hamiltonian=self.hamiltonian,
+            config=vmc_config,
+            device=self.device,
+            sign_network=self.sign_network,
+        )
+
+        vmc_results = vmc_trainer.train(verbose=True)
+
+        self.results["vmc_energy"] = vmc_results["best_energy"]
+        self.results["vmc_history"] = vmc_results
+        print(f"VMC best energy: {vmc_results['best_energy']:.6f} Ha")
+        print(f"VMC steps: {vmc_results['n_steps']}, converged: {vmc_results['converged']}")
 
     def extract_and_select_basis(self) -> torch.Tensor:
         """
@@ -579,7 +767,7 @@ class FlowGuidedKrylovPipeline:
         cfg = self.config
 
         # Direct-CI mode: use essential configs directly
-        if cfg.skip_nf_training and hasattr(self, '_essential_configs'):
+        if cfg.skip_nf_training and hasattr(self, "_essential_configs"):
             print("Direct-CI mode: using essential configs as basis")
             selected_basis = self._essential_configs
             print(f"Essential configs basis: {len(selected_basis)} configs")
@@ -589,7 +777,7 @@ class FlowGuidedKrylovPipeline:
             return selected_basis
 
         # Get accumulated basis from training
-        if hasattr(self, 'trainer') and self.trainer.accumulated_basis is not None:
+        if hasattr(self, "trainer") and self.trainer.accumulated_basis is not None:
             raw_basis = self.trainer.accumulated_basis
             print(f"Raw accumulated basis: {len(raw_basis)} configs")
         else:
@@ -602,12 +790,13 @@ class FlowGuidedKrylovPipeline:
         if self.is_molecular and cfg.use_particle_conserving_flow:
             n_orbitals = self.hamiltonian.n_orbitals
             valid, stats = verify_particle_conservation(
-                raw_basis, n_orbitals,
-                self.hamiltonian.n_alpha, self.hamiltonian.n_beta
+                raw_basis, n_orbitals, self.hamiltonian.n_alpha, self.hamiltonian.n_beta
             )
             if not valid:
-                print(f"WARNING: {stats['alpha_violations'] + stats['beta_violations']} "
-                      f"particle number violations detected!")
+                print(
+                    f"WARNING: {stats['alpha_violations'] + stats['beta_violations']} "
+                    f"particle number violations detected!"
+                )
             else:
                 print("All configurations satisfy particle conservation")
 
@@ -621,7 +810,9 @@ class FlowGuidedKrylovPipeline:
             selector = DiversitySelector(
                 config=diversity_config,
                 reference=self.reference_state,
-                n_orbitals=self.hamiltonian.n_orbitals if self.is_molecular else self.num_sites // 2,
+                n_orbitals=(
+                    self.hamiltonian.n_orbitals if self.is_molecular else self.num_sites // 2
+                ),
             )
 
             selected_basis, select_stats = selector.select(raw_basis)
@@ -635,9 +826,12 @@ class FlowGuidedKrylovPipeline:
         # CRITICAL: Always include essential configs (HF + singles + doubles)
         # even if diversity selection filtered them out. For large systems,
         # NF may never generate these, but they dominate the ground state.
-        if (self.is_molecular and hasattr(self, 'trainer') and
-                hasattr(self.trainer, '_essential_configs') and
-                self.trainer._essential_configs is not None):
+        if (
+            self.is_molecular
+            and hasattr(self, "trainer")
+            and hasattr(self.trainer, "_essential_configs")
+            and self.trainer._essential_configs is not None
+        ):
             essential = self.trainer._essential_configs
             combined = torch.cat([essential.to(selected_basis.device), selected_basis], dim=0)
             selected_basis = torch.unique(combined, dim=0)
@@ -677,13 +871,62 @@ class FlowGuidedKrylovPipeline:
             print("SKQD disabled, computing direct diagonalization...")
             return self._direct_diagonalize(nf_basis)
 
+        # NNCI expansion: expand basis with NN-guided active learning (PR-B1)
+        # before Krylov refinement. NNCI discovers important triples/quadruples
+        # beyond the CISD basis, improving the starting point for SKQD.
+        if cfg.use_nnci:
+            print("Running NNCI basis expansion...")
+            try:
+                try:
+                    from .krylov.nnci import NNCIConfig, NNCIActiveLearning
+                except ImportError:
+                    from krylov.nnci import NNCIConfig, NNCIActiveLearning
+
+                nnci_config = NNCIConfig(
+                    max_iterations=cfg.nnci_iterations,
+                    top_k=min(50, cfg.nnci_candidates_per_iter),
+                    max_candidates=cfg.nnci_candidates_per_iter,
+                    max_excitation_rank=4,
+                    training_epochs=100,
+                    convergence_threshold=1e-6,
+                    max_basis_size=min(cfg.max_diag_basis_size, 15000),
+                )
+
+                nnci = NNCIActiveLearning(
+                    hamiltonian=self.hamiltonian,
+                    initial_basis=nf_basis,
+                    config=nnci_config,
+                )
+                nnci_results = nnci.run()
+
+                expanded_basis = nnci_results["final_basis"]
+                n_added = len(expanded_basis) - len(nf_basis)
+                print(
+                    f"NNCI added {n_added} configs "
+                    f"(basis: {len(nf_basis)} -> {len(expanded_basis)})"
+                )
+                nf_basis = expanded_basis
+                self.results["nnci_configs_added"] = n_added
+                self.results["nnci_energy"] = nnci_results["energy"]
+            except (RuntimeError, MemoryError, ValueError, ImportError) as e:
+                import traceback
+
+                print(f"NNCI expansion failed: {e}")
+                traceback.print_exc()
+                self.results["nnci_configs_added"] = 0
+        else:
+            self.results["nnci_configs_added"] = 0
+
         # Configure SKQD
         skqd_config = SKQDConfig(
             max_krylov_dim=cfg.max_krylov_dim,
             time_step=cfg.time_step,
             shots_per_krylov=cfg.shots_per_krylov,
             use_gpu=(self.device == "cuda"),
-            regularization=getattr(cfg, 'skqd_regularization', 1e-8),
+            regularization=getattr(cfg, "skqd_regularization", 1e-8),
+            max_diag_basis_size=cfg.max_diag_basis_size,
+            convergence_threshold=getattr(cfg, "skqd_convergence_threshold", 1e-5),
+            adaptive_dt=getattr(cfg, "skqd_adaptive_dt", False),
         )
 
         skqd = FlowGuidedSKQD(
@@ -702,7 +945,9 @@ class FlowGuidedKrylovPipeline:
 
         # Variational consistency check
         if self.exact_energy is not None and skqd_energy < self.exact_energy - 0.001:
-            print(f"WARNING: SKQD energy ({skqd_energy:.6f}) below exact ({self.exact_energy:.6f})!")
+            print(
+                f"WARNING: SKQD energy ({skqd_energy:.6f}) below exact ({self.exact_energy:.6f})!"
+            )
             print("Numerical instability detected. Falling back to direct diagonalization.")
             return self._direct_diagonalize(nf_basis)
 
@@ -755,7 +1000,17 @@ class FlowGuidedKrylovPipeline:
 
     def _direct_diagonalize(self, basis: torch.Tensor) -> Dict[str, Any]:
         """Compute energy by direct diagonalization of basis."""
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from src.utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+
         print("Computing energy via direct diagonalization...")
+        if log_allocation:
+            log_allocation("_direct_diagonalize", len(basis), dtype="float64", layout="dense")
         H_matrix = self.hamiltonian.matrix_elements(basis, basis)
         H_np = H_matrix.detach().cpu().numpy()
         H_np = 0.5 * (H_np + H_np.T)
@@ -788,6 +1043,10 @@ class FlowGuidedKrylovPipeline:
 
         # Stage 1: Training
         self.train_flow_nqs(progress=progress)
+
+        # Stage 1b (optional): VMC training
+        if self.config.use_vmc_training:
+            self._run_vmc_training()
 
         # Stage 2: Basis extraction
         self.extract_and_select_basis()
@@ -827,19 +1086,24 @@ class FlowGuidedKrylovPipeline:
             print(f"Final Energy:      {self.results['combined_energy']:.8f}")
 
         if self.exact_energy is not None:
-            best_energy = self.results.get("combined_energy",
-                           self.results.get("skqd_energy",
-                           self.results.get("sqd_energy",
-                           self.results.get("nf_nqs_energy"))))
-            error_ha = abs(best_energy - self.exact_energy)
-            error_mha = error_ha * 1000
-            error_kcal = error_ha * 627.5
-            print(f"\nError: {error_mha:.4f} mHa ({error_kcal:.4f} kcal/mol)")
-
-            if error_kcal < 1.0:
-                print("Chemical accuracy: PASS")
+            best_energy = self.results.get(
+                "combined_energy",
+                self.results.get(
+                    "skqd_energy", self.results.get("sqd_energy", self.results.get("nf_nqs_energy"))
+                ),
+            )
+            if best_energy is None:
+                print("\nError: N/A (energy not computed)")
             else:
-                print("Chemical accuracy: FAIL")
+                error_ha = abs(best_energy - self.exact_energy)
+                error_mha = error_ha * 1000
+                error_kcal = error_ha * 627.5
+                print(f"\nError: {error_mha:.4f} mHa ({error_kcal:.4f} kcal/mol)")
+
+                if error_kcal < 1.0:
+                    print("Chemical accuracy: PASS")
+                else:
+                    print("Chemical accuracy: FAIL")
 
         print("=" * 60)
 

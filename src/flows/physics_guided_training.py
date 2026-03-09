@@ -16,6 +16,7 @@ References:
 - Importance sampling: configurations with low local energy matter more
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,6 +37,15 @@ try:
 except ImportError:
     from utils.connection_cache import ConnectionCache
 
+# AutoregressiveFlowSampler import — optional, graceful fallback to None sentinel
+try:
+    from .autoregressive_flow import AutoregressiveFlowSampler as _AutoregressiveFlowSampler
+except ImportError:
+    try:
+        from flows.autoregressive_flow import AutoregressiveFlowSampler as _AutoregressiveFlowSampler
+    except ImportError:
+        _AutoregressiveFlowSampler = None  # type: ignore[assignment,misc]
+
 
 @dataclass
 class PhysicsGuidedConfig:
@@ -53,14 +63,15 @@ class PhysicsGuidedConfig:
     # Training epochs
     num_epochs: int = 500
     min_epochs: int = 150
-    convergence_threshold: float = 0.20
+    convergence_threshold: float = 0.35
 
-    # Loss weights - following paper's approach
-    # Paper uses only cross-entropy for NF, weighted by |E|
-    # Set physics_weight=0 and entropy_weight=0 to match paper exactly
-    teacher_weight: float = 1.0  # Cross-entropy (paper's only term)
-    physics_weight: float = 0.0  # Paper doesn't use this
-    entropy_weight: float = 0.0  # Paper doesn't use this
+    # Loss weights
+    # Teacher: cross-entropy KL(NQS || Flow) — the paper's primary term
+    # Physics: REINFORCE energy gradient — direct "low energy is better" signal
+    # Entropy: regularizer to prevent mode collapse
+    teacher_weight: float = 1.0  # Cross-entropy (paper's primary term)
+    physics_weight: float = 0.1  # REINFORCE energy gradient signal
+    entropy_weight: float = 0.05  # Entropy regularization for exploration
 
     # Energy baseline for physics signal
     use_energy_baseline: bool = True  # Subtract baseline for variance reduction
@@ -76,8 +87,8 @@ class PhysicsGuidedConfig:
 
     # Temperature annealing for particle-conserving flow
     initial_temperature: float = 1.0
-    final_temperature: float = 0.1
-    temperature_decay_epochs: int = 200
+    final_temperature: float = 0.3
+    temperature_decay_epochs: int = 400
 
     # Connection caching for avoiding recomputation
     use_connection_cache: bool = True
@@ -171,9 +182,12 @@ class PhysicsGuidedFlowTrainer:
         self.config = config
         self.device = device
 
-        # Optimizers
+        # Optimizers — exclude log_temperature from gradient updates because
+        # temperature is controlled by the external annealing schedule (line ~511).
+        # Including it would let AdamW fight the schedule each step.
+        flow_params = [p for n, p in flow.named_parameters() if 'log_temperature' not in n]
         self.flow_optimizer = torch.optim.AdamW(
-            flow.parameters(), lr=config.flow_lr, weight_decay=1e-5
+            flow_params, lr=config.flow_lr, weight_decay=1e-5
         )
         self.nqs_optimizer = torch.optim.AdamW(
             nqs.parameters(), lr=config.nqs_lr, weight_decay=1e-5
@@ -280,15 +294,34 @@ class PhysicsGuidedFlowTrainer:
         if config.include_doubles_in_basis:
             from itertools import combinations
 
-            # Limit doubles for very large systems (avoid memory issues)
+            # Proportional doubles allocation per type.
+            # αβ doubles dominate correlation energy — each type gets a fair
+            # share proportional to its total count, with αβ guaranteed >= 50%.
             max_doubles = 5000
+            from math import comb as _comb
+            n_aa_total = _comb(n_alpha, 2) * _comb(len(virt_alpha), 2)
+            n_bb_total = _comb(n_beta, 2) * _comb(len(virt_beta), 2)
+            n_ab_total = n_alpha * n_beta * len(virt_alpha) * len(virt_beta)
+            total_possible = n_aa_total + n_bb_total + n_ab_total
 
-            doubles_count = 0
+            if total_possible <= max_doubles:
+                max_aa = n_aa_total
+                max_bb = n_bb_total
+                max_ab = n_ab_total
+            else:
+                ab_frac = max(0.5, n_ab_total / total_possible if total_possible > 0 else 0.5)
+                remaining_frac = 1.0 - ab_frac
+                aa_frac = remaining_frac * (n_aa_total / (n_aa_total + n_bb_total)) if (n_aa_total + n_bb_total) > 0 else 0
+                bb_frac = remaining_frac - aa_frac
+                max_ab = int(ab_frac * max_doubles)
+                max_aa = int(aa_frac * max_doubles)
+                max_bb = max_doubles - max_ab - max_aa
 
             # Alpha-alpha doubles
+            aa_count = 0
             for i, j in combinations(occ_alpha, 2):
                 for a, b in combinations(virt_alpha, 2):
-                    if doubles_count >= max_doubles:
+                    if aa_count >= max_aa:
                         break
                     new_config = hf_state.clone()
                     new_config[i] = 0
@@ -296,14 +329,15 @@ class PhysicsGuidedFlowTrainer:
                     new_config[a] = 1
                     new_config[b] = 1
                     essential.append(new_config)
-                    doubles_count += 1
-                if doubles_count >= max_doubles:
+                    aa_count += 1
+                if aa_count >= max_aa:
                     break
 
             # Beta-beta doubles
+            bb_count = 0
             for i, j in combinations(occ_beta, 2):
                 for a, b in combinations(virt_beta, 2):
-                    if doubles_count >= max_doubles:
+                    if bb_count >= max_bb:
                         break
                     new_config = hf_state.clone()
                     new_config[i + n_orb] = 0
@@ -311,16 +345,17 @@ class PhysicsGuidedFlowTrainer:
                     new_config[a + n_orb] = 1
                     new_config[b + n_orb] = 1
                     essential.append(new_config)
-                    doubles_count += 1
-                if doubles_count >= max_doubles:
+                    bb_count += 1
+                if bb_count >= max_bb:
                     break
 
             # Alpha-beta doubles (most important for correlation)
+            ab_count = 0
             for i in occ_alpha:
                 for j in occ_beta:
                     for a in virt_alpha:
                         for b in virt_beta:
-                            if doubles_count >= max_doubles:
+                            if ab_count >= max_ab:
                                 break
                             new_config = hf_state.clone()
                             new_config[i] = 0
@@ -328,12 +363,12 @@ class PhysicsGuidedFlowTrainer:
                             new_config[a] = 1
                             new_config[b + n_orb] = 1
                             essential.append(new_config)
-                            doubles_count += 1
-                        if doubles_count >= max_doubles:
+                            ab_count += 1
+                        if ab_count >= max_ab:
                             break
-                    if doubles_count >= max_doubles:
+                    if ab_count >= max_ab:
                         break
-                if doubles_count >= max_doubles:
+                if ab_count >= max_ab:
                     break
 
         # Stack and remove duplicates
@@ -482,11 +517,15 @@ class PhysicsGuidedFlowTrainer:
         pbar = tqdm(range(config.num_epochs), desc="Training")
 
         for epoch in pbar:
-            # Temperature annealing for particle-conserving flow
+            # Temperature annealing for particle-conserving flow (exponential decay)
+            # T(e) = T_final + (T_init - T_final) * exp(-rate * e)
+            # Rate chosen so T ≈ T_final + 0.01*(T_init-T_final) at decay_epochs
             if hasattr(self.flow, 'set_temperature'):
-                progress = min(1.0, epoch / config.temperature_decay_epochs)
-                temperature = config.initial_temperature + progress * (
-                    config.final_temperature - config.initial_temperature
+                decay_rate = math.log(100) / max(config.temperature_decay_epochs, 1)
+                temperature = (
+                    config.final_temperature
+                    + (config.initial_temperature - config.final_temperature)
+                    * math.exp(-decay_rate * epoch)
                 )
                 self.flow.set_temperature(temperature)
 
@@ -688,6 +727,12 @@ class PhysicsGuidedFlowTrainer:
         """
         Compute energy by diagonalizing H in sampled subspace (paper's method).
 
+        NOTE: This function is called inside torch.no_grad() context (line 632).
+        The returned energy provides NO gradient to the flow or NQS. It is used
+        only for monitoring and as a scalar multiplier in loss scaling (|E|).
+        The actual training gradient comes from local energies via REINFORCE
+        in _compute_nqs_loss().
+
         From paper Section 3.2-3.3:
         "Energy is computed by diagonalizing H restricted to the sampled subspace S"
 
@@ -744,15 +789,19 @@ class PhysicsGuidedFlowTrainer:
                         all_probs = torch.exp(2 * all_log_amp)
 
                     # Identify which configs are NOT in essential set using integer encoding
-                    n_sites = configs.shape[1]
-                    powers = (2 ** torch.arange(n_sites, device=configs.device, dtype=torch.long)).flip(0)
-                    all_ints = (configs.long() * powers).sum(dim=1)
-                    ess_ints = (self._essential_configs.long() * powers).sum(dim=1)
-                    ess_set = set(ess_ints.cpu().tolist())
+                    # Overflow-safe: handles n_sites >= 64
+                    try:
+                        from ..utils.config_hash import config_integer_hash
+                    except ImportError:
+                        from utils.config_hash import config_integer_hash
+
+                    all_ints = config_integer_hash(configs)
+                    ess_ints = config_integer_hash(self._essential_configs)
+                    ess_set = set(ess_ints)
 
                     # Mask for non-essential configs
                     non_ess_mask = torch.tensor(
-                        [int(x) not in ess_set for x in all_ints.cpu().tolist()],
+                        [x not in ess_set for x in all_ints],
                         device=configs.device, dtype=torch.bool,
                     )
 
@@ -786,9 +835,7 @@ class PhysicsGuidedFlowTrainer:
             eigenvalues = torch.linalg.eigvalsh(H_sub)
             E_ground = eigenvalues[0]
 
-        # Return as tensor that can flow through gradient computation
-        # (even though we detach it, keeping consistent tensor type helps)
-        return E_ground.float()
+        return E_ground
 
     def _compute_local_energies(
         self,
@@ -857,7 +904,7 @@ class PhysicsGuidedFlowTrainer:
             log_psi_orig = nqs_forward(configs.float()).clone()
 
             # Step 6: Evaluate NQS on ALL connected configs in large chunks
-            log_psi_connected = torch.empty(total_connections, device=self.device)
+            log_psi_connected = torch.empty(total_connections, device=self.device, dtype=torch.float64)
 
             for start in range(0, total_connections, nqs_chunk_size):
                 end = min(start + nqs_chunk_size, total_connections)
@@ -873,7 +920,7 @@ class PhysicsGuidedFlowTrainer:
             weighted = all_elements * ratios
 
             # Step 9: Accumulate off-diagonal contributions using scatter_add
-            off_diag = torch.zeros(n_configs, device=self.device)
+            off_diag = torch.zeros(n_configs, dtype=weighted.dtype, device=self.device)
             off_diag.scatter_add_(0, all_orig_indices, weighted)
 
             # Step 10: Total local energy = diagonal + off-diagonal
@@ -907,6 +954,9 @@ class PhysicsGuidedFlowTrainer:
 
         if use_cache and self.connection_cache is not None:
             return self.connection_cache.get_batch(configs, self.hamiltonian)
+        elif hasattr(self.hamiltonian, 'get_connections_vectorized_batch'):
+            # Vectorized batch path: 30-70x faster than sequential on GPU
+            return self.hamiltonian.get_connections_vectorized_batch(configs)
         elif (config.use_parallel_connections and
               hasattr(self.hamiltonian, 'get_connections_parallel')):
             return self.hamiltonian.get_connections_parallel(
@@ -1017,6 +1067,8 @@ class PhysicsGuidedFlowTrainer:
         # NOTE: Do NOT multiply by n_total - that was a bug causing ~300,000x energy inflation!
         sampled_probs = probs[indices]
         reweight_factor = 1.0 / (n_sample * sampled_probs + 1e-10)
+        # Clip to prevent weight explosion when sampled_probs << 1
+        reweight_factor = torch.clamp(reweight_factor, max=100.0)
         reweighted_elements = all_elements[indices] * reweight_factor
 
         return (
@@ -1044,10 +1096,27 @@ class PhysicsGuidedFlowTrainer:
         """
         config = self.config
 
-        # Get flow probabilities
-        flow_probs = self.flow.estimate_discrete_prob(unique_configs)
-        flow_probs = flow_probs / (flow_probs.sum() + 1e-10)
-        log_flow_probs = torch.log(flow_probs + 1e-10)
+        # Get flow log-probabilities directly (avoids exp→log round-trip precision loss).
+        # The old path: estimate_discrete_prob → log(exp(lp) + eps) would underflow
+        # for log_prob < -87 (float32), returning -23.03 instead of the true value.
+        log_flow_probs_raw = self.flow.log_prob(unique_configs)
+
+        # AutoregressiveFlowSampler log_prob() returns exact, fully-normalized log
+        # probabilities (sum over ALL valid configs = 1.0, proven by the autoregressive
+        # factorization).  Re-normalizing over only the current batch would inflate every
+        # config's probability by log(1 / sum_batch), introducing a systematic bias.
+        # For ParticleConservingFlowSampler the batch re-normalization is kept as a
+        # safety measure (its Plackett-Luce probabilities are normalized but the
+        # logsumexp guard has historically masked any numerical drift).
+        _is_ar_flow = _AutoregressiveFlowSampler is not None and isinstance(
+            self.flow, _AutoregressiveFlowSampler
+        )
+        if _is_ar_flow:
+            log_flow_probs = log_flow_probs_raw
+        else:
+            log_Z = torch.logsumexp(log_flow_probs_raw, dim=0)
+            log_flow_probs = log_flow_probs_raw - log_Z
+        flow_probs = torch.exp(log_flow_probs)
 
         # === Teacher Loss ===
         # KL(NQS || Flow) = sum p_nqs * (log p_nqs - log p_flow)
@@ -1071,20 +1140,20 @@ class PhysicsGuidedFlowTrainer:
         # H(flow) = -sum p_flow * log p_flow
         entropy = -torch.sum(flow_probs * log_flow_probs)
 
-        # Combined loss
-        total_loss = (
-            config.teacher_weight * teacher_loss +
-            config.physics_weight * physics_loss -
-            config.entropy_weight * entropy
-        )
+        # Combined loss: entropy is a regularizer independent of energy scale,
+        # so it must NOT be multiplied by |E|/batch_size. Only teacher and physics
+        # losses scale with energy magnitude (paper Eq. 16).
+        batch_size = len(all_configs)
+        energy_scale = torch.abs(energy.detach()) / batch_size
 
-        # Scale by energy magnitude - MULTIPLY not divide (paper Eq. 16)
-        # Paper: L_φ = -|E[ψ_θ]|/|S| × Σ p_θ(x) × log(p̂_φ(x))
-        # The |E| factor prioritizes learning when energy is poor (high magnitude)
-        # For molecular systems with E ~ -60 to -80 Ha, this amplifies gradients
-        # We divide by |S| (number of unique configs) for normalization
-        n_unique = len(unique_configs)
-        total_loss = total_loss * torch.abs(energy.detach()) / n_unique
+        # Scale teacher + physics by energy magnitude
+        scaled_loss = (
+            config.teacher_weight * teacher_loss +
+            config.physics_weight * physics_loss
+        ) * energy_scale
+
+        # Entropy is added separately, unscaled — it's a pure regularizer
+        total_loss = scaled_loss - config.entropy_weight * entropy
 
         components = {
             'teacher': teacher_loss,
@@ -1108,6 +1177,11 @@ class PhysicsGuidedFlowTrainer:
         """
         # Recompute with gradients
         log_amp = self.nqs.log_amplitude(configs.float())
+        # NOTE: log_probs = 2 * log_amp computes log(|psi|^2).
+        # This means the effective gradient is 2x standard REINFORCE.
+        # For real-valued wavefunctions, this is equivalent to doubling nqs_lr.
+        # This is intentional — it follows the standard VMC gradient formula:
+        # d<E>/dtheta = 2 * Re[<(E_loc - <E>) * d(log psi)/dtheta>]
         log_probs = 2 * log_amp  # log(|psi|^2) = 2 * log|psi|
 
         # REINFORCE-style gradient
@@ -1139,48 +1213,42 @@ class PhysicsGuidedFlowTrainer:
             # First call: initialize with essential configs
             new_configs = torch.cat([self._essential_configs, new_configs], dim=0)
 
-        # Use integer hash for fast deduplication
-        # Note: CUDA doesn't support matmul for Long tensors, so we use float64
-        # which has enough precision for exact integers up to 2^53
-        if num_sites <= 52:
-            powers = (2.0 ** torch.arange(num_sites - 1, -1, -1, device=device, dtype=torch.float64))
+        # Use overflow-safe integer hash for fast deduplication
+        # Handles n_sites >= 64 (40+ orbitals) without int64 overflow
+        try:
+            from ..utils.config_hash import config_integer_hash
+        except ImportError:
+            from utils.config_hash import config_integer_hash
 
-            if self.accumulated_basis is None:
-                # First batch: just deduplicate new_configs
-                keys = (new_configs.double() @ powers).long().tolist()
-                seen = {}
-                unique_indices = []
-                for i, k in enumerate(keys):
-                    if k not in seen:
-                        seen[k] = True
-                        unique_indices.append(i)
-                self.accumulated_basis = new_configs[unique_indices]
-            else:
-                # Compute keys for existing basis
-                existing_keys = (self.accumulated_basis.double() @ powers).long().tolist()
-                existing_set = set(existing_keys)
-
-                # Find new unique configs
-                new_keys = (new_configs.double() @ powers).long().tolist()
-                new_unique_indices = []
-                for i, k in enumerate(new_keys):
-                    if k not in existing_set:
-                        existing_set.add(k)
-                        new_unique_indices.append(i)
-
-                # Append new unique configs
-                if new_unique_indices:
-                    self.accumulated_basis = torch.cat([
-                        self.accumulated_basis,
-                        new_configs[new_unique_indices]
-                    ], dim=0)
+        if self.accumulated_basis is None:
+            # First batch: just deduplicate new_configs
+            keys = config_integer_hash(new_configs)
+            seen = {}
+            unique_indices = []
+            for i, k in enumerate(keys):
+                if k not in seen:
+                    seen[k] = True
+                    unique_indices.append(i)
+            self.accumulated_basis = new_configs[unique_indices]
         else:
-            # For very large systems, fall back to torch.unique
-            if self.accumulated_basis is None:
-                self.accumulated_basis = torch.unique(new_configs, dim=0)
-            else:
-                combined = torch.cat([self.accumulated_basis, new_configs], dim=0)
-                self.accumulated_basis = torch.unique(combined, dim=0)
+            # Compute keys for existing basis
+            existing_keys = config_integer_hash(self.accumulated_basis)
+            existing_set = set(existing_keys)
+
+            # Find new unique configs
+            new_keys = config_integer_hash(new_configs)
+            new_unique_indices = []
+            for i, k in enumerate(new_keys):
+                if k not in existing_set:
+                    existing_set.add(k)
+                    new_unique_indices.append(i)
+
+            # Append new unique configs
+            if new_unique_indices:
+                self.accumulated_basis = torch.cat([
+                    self.accumulated_basis,
+                    new_configs[new_unique_indices]
+                ], dim=0)
 
         # Prune if too large - keep essential configs + random subset of the rest
         if len(self.accumulated_basis) > max_size:
@@ -1189,11 +1257,8 @@ class PhysicsGuidedFlowTrainer:
                 # Previous bug: random pruning could lose these, causing NF to explore
                 # wrong region of Hilbert space for large systems like C2H4
                 n_essential = len(self._essential_configs)
-                n_sites = self.accumulated_basis.shape[1]
-                powers = (2.0 ** torch.arange(n_sites - 1, -1, -1, device=device, dtype=torch.float64))
-
-                ess_ints = set((self._essential_configs.double() @ powers).long().tolist())
-                acc_ints = (self.accumulated_basis.double() @ powers).long().tolist()
+                ess_ints = set(config_integer_hash(self._essential_configs))
+                acc_ints = config_integer_hash(self.accumulated_basis)
 
                 essential_mask = torch.tensor(
                     [k in ess_ints for k in acc_ints], dtype=torch.bool, device=device
@@ -1219,14 +1284,50 @@ class PhysicsGuidedFlowTrainer:
         """
         Compute energy in accumulated basis via diagonalization.
 
-        Uses sparse eigensolver for large bases (>500 configs) for efficiency.
+        Uses direct sparse construction for large bases (>3000 configs)
+        to avoid O(n²) dense matrix allocation.
         """
         if self.accumulated_basis is None or len(self.accumulated_basis) == 0:
             return float('inf')
 
         n_basis = len(self.accumulated_basis)
 
+        try:
+            from utils.memory_logger import log_allocation
+        except ImportError:
+            try:
+                from ..utils.memory_logger import log_allocation
+            except ImportError:
+                log_allocation = None
+
         with torch.no_grad():
+            # Direct sparse path for large bases — avoids dense n×n allocation.
+            # Dense 16384² × 8 = 2.1 GB; sparse ~50 MB.
+            SPARSE_ACCUM_THRESHOLD = 3000
+            if n_basis > SPARSE_ACCUM_THRESHOLD and hasattr(self.hamiltonian, 'get_sparse_matrix_elements'):
+                if log_allocation:
+                    log_allocation("_compute_accumulated_energy", n_basis, dtype="float64", layout="sparse")
+                from scipy.sparse import coo_matrix, diags
+                from scipy.sparse.linalg import eigsh
+
+                basis = self.accumulated_basis
+                rows, cols, vals = self.hamiltonian.get_sparse_matrix_elements(basis)
+                rows_np = rows.cpu().numpy()
+                cols_np = cols.cpu().numpy()
+                vals_np = vals.cpu().numpy().astype(np.float64)
+
+                H_coo = coo_matrix((vals_np, (rows_np, cols_np)), shape=(n_basis, n_basis))
+                diag_np = self.hamiltonian.diagonal_elements_batch(basis).cpu().numpy().astype(np.float64)
+                H_csr = H_coo.tocsr()
+                H_csr = 0.5 * (H_csr + H_csr.T)
+                H_csr = H_csr + diags(diag_np, 0, shape=(n_basis, n_basis), format='csr')
+
+                eigenvalues, _ = eigsh(H_csr, k=1, which='SA', tol=1e-6)
+                return float(eigenvalues[0])
+
+            # Dense path for small bases
+            if log_allocation:
+                log_allocation("_compute_accumulated_energy", n_basis, dtype="float64", layout="dense")
             H_matrix = self.hamiltonian.matrix_elements(
                 self.accumulated_basis, self.accumulated_basis
             )
@@ -1235,7 +1336,7 @@ class PhysicsGuidedFlowTrainer:
             # Ensure Hermitian
             H_np = 0.5 * (H_np + H_np.T)
 
-            # Use sparse eigensolver for large matrices
+            # Use sparse eigensolver for medium matrices
             if n_basis > 500:
                 try:
                     from scipy.sparse import csr_matrix
@@ -1243,8 +1344,8 @@ class PhysicsGuidedFlowTrainer:
                     H_sparse = csr_matrix(H_np)
                     eigenvalues, _ = eigsh(H_sparse, k=1, which='SA', tol=1e-6)
                     return float(eigenvalues[0])
-                except Exception:
-                    pass  # Fall back to dense
+                except Exception as e:
+                    print(f"WARNING: sparse eigsh failed in _compute_accumulated_energy ({e}), falling back to dense")
 
             # Dense diagonalization for small matrices
             eigenvalues, _ = np.linalg.eigh(H_np)
@@ -1256,9 +1357,9 @@ def create_physics_guided_trainer(
     nqs: nn.Module,
     hamiltonian: Any,
     device: str = "cuda",
-    teacher_weight: float = 0.5,
-    physics_weight: float = 0.4,
-    entropy_weight: float = 0.1,
+    teacher_weight: float = 1.0,
+    physics_weight: float = 0.1,
+    entropy_weight: float = 0.05,
     **kwargs,
 ) -> PhysicsGuidedFlowTrainer:
     """
