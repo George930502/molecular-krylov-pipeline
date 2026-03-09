@@ -2165,6 +2165,7 @@ def compute_molecular_integrals(
     spin: int = 0,
     use_cache: bool = True,
     cas: Optional[Tuple[int, int]] = None,
+    casci: bool = False,
 ) -> MolecularIntegrals:
     """
     Compute molecular integrals using PySCF, with optional disk caching.
@@ -2176,8 +2177,12 @@ def compute_molecular_integrals(
         spin: 2S (number of unpaired electrons)
         use_cache: If True, check/store disk cache in ~/.cache/molecular-krylov/
         cas: Optional (nelecas, ncas) tuple for CAS active space selection.
-            When provided, runs CASSCF after RHF and returns integrals
-            in the active space only (n_orbitals = ncas).
+            When provided, runs CASSCF (or CASCI if casci=True) after RHF
+            and returns integrals in the active space only (n_orbitals = ncas).
+        casci: If True and cas is not None, use CASCI instead of CASSCF.
+            CASCI uses HF MOs directly (no orbital optimization), which is
+            faster for large active spaces where CASSCF's iterative FCI solver
+            is prohibitively expensive (e.g., CAS(10,15)+ with 9M+ configs).
 
     Returns:
         MolecularIntegrals object
@@ -2236,7 +2241,14 @@ def compute_molecular_integrals(
         from pyscf import mcscf, fci
 
         nelecas, ncas = cas
-        mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
+
+        if casci:
+            # CASCI: no orbital optimization, uses HF MOs directly.
+            # Much faster for large active spaces where CASSCF's iterative
+            # FCI solver is prohibitively expensive (e.g., CAS(10,15)+).
+            mc = mcscf.CASCI(mf, ncas=ncas, nelecas=nelecas)
+        else:
+            mc = mcscf.CASSCF(mf, ncas=ncas, nelecas=nelecas)
 
         # Linear molecules (D∞h/C∞v) with symmetry=True can cause
         # PointGroupSymmetryError when CAS orbital selection breaks
@@ -2246,7 +2258,7 @@ def compute_molecular_integrals(
 
         mc.kernel()
 
-        if not mc.converged:
+        if not casci and not mc.converged:
             import warnings
             warnings.warn(
                 f"CASSCF did not converge for CAS({nelecas},{ncas}). "
@@ -2503,7 +2515,13 @@ def create_n2_cas_hamiltonian(
         ("N", (0.0, 0.0, 0.0)),
         ("N", (0.0, 0.0, bond_length)),
     ]
-    integrals = compute_molecular_integrals(geometry, basis=basis, cas=cas)
+    # CASCI fallback for large active spaces where CASSCF's internal FCI
+    # is too slow (e.g., CAS(10,15) has C(15,5)^2 = 9M+ configs).
+    nelecas, ncas = cas
+    use_casci = ncas >= 15
+    integrals = compute_molecular_integrals(
+        geometry, basis=basis, cas=cas, casci=use_casci
+    )
     return MolecularHamiltonian(integrals, device=device)
 
 
@@ -2627,5 +2645,58 @@ def create_cr2_hamiltonian(
         n_orbitals=ncas,
         n_alpha=n_alpha_cas,
         n_beta=n_beta_cas,
+    )
+    return MolecularHamiltonian(integrals, device=device)
+
+
+def create_benzene_hamiltonian(
+    basis: str = "sto-3g",
+    cas: Optional[Tuple[int, int]] = (6, 15),
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+) -> MolecularHamiltonian:
+    """
+    Create benzene (C6H6) Hamiltonian with CAS active space reduction.
+
+    Benzene in D6h geometry (regular hexagon). Default active space is
+    CAS(6,15) = 6 pi electrons in 15 orbitals (pi + sigma correlation).
+    C(15,3)^2 = 455^2 = 207,025 configurations = 30 qubits.
+
+    For CAS with ncas >= 15, automatically uses CASCI (no orbital
+    optimization) since CASSCF's iterative FCI solver is prohibitively
+    expensive at that scale.
+
+    Args:
+        basis: Basis set name (default: sto-3g)
+        cas: Optional (nelecas, ncas) for active space. Default: (6, 15).
+            Set to None for full-space (not recommended: 42e, 36o in STO-3G).
+        device: Computation device
+
+    Returns:
+        MolecularHamiltonian over the CAS active space (or full space)
+    """
+    import math as _math
+
+    # Regular hexagon: R(C-C) = 1.40 A, R(C-H) = 1.08 A
+    cc_dist = 1.40
+    ch_dist = 1.08
+
+    geometry = []
+    for i in range(6):
+        angle = _math.pi / 3 * i
+        cx = cc_dist * _math.cos(angle)
+        cy = cc_dist * _math.sin(angle)
+        geometry.append(("C", (cx, cy, 0.0)))
+        hx = (cc_dist + ch_dist) * _math.cos(angle)
+        hy = (cc_dist + ch_dist) * _math.sin(angle)
+        geometry.append(("H", (hx, hy, 0.0)))
+
+    # CASCI fallback for large active spaces
+    use_casci = False
+    if cas is not None:
+        _, ncas = cas
+        use_casci = ncas >= 15
+
+    integrals = compute_molecular_integrals(
+        geometry, basis=basis, cas=cas, casci=use_casci
     )
     return MolecularHamiltonian(integrals, device=device)
